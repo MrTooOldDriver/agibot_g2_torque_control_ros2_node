@@ -2,8 +2,9 @@
 # torque_subscriber_node.py read the same file).
 /**:
   ros__parameters:
-    # Robot access (C++ node only): "gdk" (real robot), "fake" (simulated arms) or a module path.
-    # The Python node uses whichever agibot_gdk is on PYTHONPATH.
+    # Robot access: "gdk" (real robot) or "fake" (simulated arms); the C++ node also takes a
+    # backend module path. The Python node uses the agibot_gdk found first on PYTHONPATH and
+    # refuses to connect unless it is the one named here (fake: share/<pkg>/fake_gdk).
     backend: "gdk"
 
     # Dynamics model. Empty urdf_path: use <urdf_dir>/<urdf_type>/<urdf_type>.urdf with the
@@ -37,7 +38,8 @@
 
     # Safety
     max_torque_step: 15.0         # Nm per frame per joint (robot e-stops at > 50)
-    effort_limit_scale: 1.0       # clamp total torque to this fraction of the URDF effort limit
+    effort_limit_scale: 1.0       # clamp total torque to this fraction of the URDF effort limit;
+                                  # refuse to start if the measured holding torque exceeds it
     joint_damping: 0.0            # Nm*s/rad, added as -joint_damping * dq
     velocity_limit: 2.0           # rad/s; any arm joint faster -> end stream, restore mode (0 = off)
     # Nm. Gravity compensation on: refuse to start if |g(q) - measured effort| exceeds it.

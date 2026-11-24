@@ -31,8 +31,9 @@ class DynamicsModel {
   // Throws std::runtime_error on an unreadable URDF or a missing / non-1-DoF arm joint.
   explicit DynamicsModel(const std::string& urdf_path);
 
-  // Locate the arm joints (and the non-arm joints of the model) in a frame. Cheap when the frame
-  // layout is unchanged. Returns false if an arm joint is missing from the frame.
+  // Locate the arm joints (and the non-arm joints of the model) in a frame. Cheap and
+  // allocation-free when the frame's joint names (all of them, in order) are unchanged. Returns
+  // false if an arm joint is missing from the frame.
   bool Bind(const JointFrame& frame);
 
   // Arm position / velocity / measured effort of a bound frame, kArmJointNames order.
@@ -74,7 +75,7 @@ class DynamicsModel {
   bool gravity_valid_{false};
   std::vector<Other> others_;
   std::vector<BoundOther> bound_others_;
-  std::size_t bound_size_{0};
+  std::vector<std::string> bound_names_;  // frame layout the indices above belong to (empty: none)
 };
 
 }  // namespace g2_torque_subscriber

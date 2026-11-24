@@ -9,8 +9,10 @@ src/torque_subscriber_node.cpp. Each arm listens on its own topic (std_msgs/Floa
         + [compensate_coriolis] C(q, dq) dq          (measured velocities, waist/head included)
         + [compensate_inertia]  M(q) ddq_d           (ddq_d from ~/<arm>/desired_accelerations)
         + tau_ext - joint_damping * dq
-    tau = clamp(tau, +-effort_limit_scale * URDF effort limit)
+    tau = clamp(tau, +-cap)                  cap = effort_limit_scale * URDF effort limit
     tau = tau_prev + clamp(tau - tau_prev, +-max_torque_step)     (tau_prev of frame 0 = measured effort)
+    tau = clamp(tau, +-cap)                  (no-op: the node refuses to start when the measured
+                                              holding torque is outside the cap)
 
 Gravity compensation on: a timed-out arm keeps the compensation terms (tau_ext = 0, it floats).
 Gravity compensation off: the commands carry the full torque; mode 9 is entered only once both
@@ -19,9 +21,14 @@ would drop a G2 arm).
 
 Threads: the GDK torque loop (agibot_gdk Robot.joint_torque_control: read -> callback -> write,
 1 kHz best effort in Python) runs on the main thread; the rclpy executor spins on a background
-thread. The C++ node is the one to use when timing matters.
+thread, and a third thread publishes the states the loop hands over (the callback never waits for
+it). The C++ node is the one to use when timing matters.
 
-Needs Python 3.10 (the GDK binding is cpython-310), i.e. the ROS 2 Humble container.
+The backend parameter must match the agibot_gdk module found first on PYTHONPATH: "gdk" the real
+GDK, "fake" test/fake_gdk. The node refuses to connect otherwise.
+
+The Python version must match the GDK binding: cpython-310 for the x86 development GDK (ROS 2
+Humble container), cpython-312 for the GDK on the robot computer (ROS 2 Jazzy).
 """
 
 import os
@@ -48,6 +55,7 @@ ARM_JOINT_NAMES = [  # left joint1..7, then right joint1..7 (every 14-vector use
 ARM_DOF = len(ARM_JOINT_NAMES)
 ARM_LABELS = ("left", "right")
 MODE_JOINT_TORQUE = 9
+MODE_SWITCH_TIMEOUT_MS = 500  # wait_control_mode when entering and leaving mode 9
 
 
 def arm_slice(arm):
@@ -240,6 +248,15 @@ class TorqueSubscriberNode(Node):
                      "gravity included. Mode 9 is entered only once both arms are commanded close "
                      "to the holding torque; a missing command ends the torque loop.")
 
+        # State publishing, as in the C++ node: the control loop hands the latest sample over
+        # without waiting (_hand_off) and this thread publishes it. Not a daemon: stop_publisher()
+        # joins it before the node is destroyed.
+        self._pub_cv = threading.Condition()
+        self._pub_sample = None
+        self._pub_stop = False
+        self._pub_thread = threading.Thread(target=self._publisher, name="state_publisher")
+        self._pub_thread.start()
+
     # ------------------------------------------------------------------------------------------
     def _declare_parameters(self):
         d = self.declare_parameter
@@ -272,9 +289,9 @@ class TorqueSubscriberNode(Node):
             "enforce_realtime": bool(d("enforce_realtime", False).value),
             "state_timeout_ms": int(d("state_timeout_ms", 100).value),
         }
-        # Accepted for a shared parameter file with the C++ node; the Python node always uses the
-        # agibot_gdk module found on PYTHONPATH (test/fake_gdk for offline tests).
-        d("backend", "gdk")
+        # The Python node uses the agibot_gdk module found first on PYTHONPATH; backend says which
+        # one that must be ("gdk" or "fake", see _check_backend). Module paths are C++ only.
+        p["backend"] = d("backend", "gdk").value
         if not 0.0 < p["max_torque_step"] < 50.0:
             raise ValueError("max_torque_step must be in (0, 50) Nm (robot e-stops at 50)")
         if not 0.0 < p["effort_limit_scale"] <= 1.0:
@@ -349,8 +366,29 @@ class TorqueSubscriberNode(Node):
     # ------------------------------------------------------------------------------------------
     # Control (main thread)
     # ------------------------------------------------------------------------------------------
+    def _check_backend(self, gdk):
+        """The imported agibot_gdk must be the one the backend parameter asks for, so that a
+        rehearsal with backend:=fake can never reach the robot through the real GDK."""
+        backend = self.p["backend"]
+        fake = bool(getattr(gdk, "IS_G2_FAKE", False))
+        where = getattr(gdk, "__file__", "?")
+        if backend not in ("gdk", "fake"):
+            self.get_logger().fatal(f"backend '{backend}': the Python node supports 'gdk' or "
+                                    "'fake' only (module paths are for the C++ node)")
+            return False
+        if (backend == "fake") != fake:
+            self.get_logger().fatal(
+                f"backend:={backend} but the agibot_gdk imported from {where} is "
+                + ("the fake GDK" if fake else "the real GDK")
+                + ". Put the matching agibot_gdk first on PYTHONPATH (the fake: "
+                "<prefix>/share/g2_torque_subscriber/fake_gdk); not connecting.")
+            return False
+        return True
+
     def run_control(self, gdk):
         log = self.get_logger()
+        if not self._check_backend(gdk):
+            return 1
         self.phase = "connecting"
         robot = self._connect(gdk)
         if robot is None:
@@ -396,7 +434,7 @@ class TorqueSubscriberNode(Node):
         # ---- Dynamics model ----
         urdf = self.p["urdf_path"]
         if not urdf:
-            urdf_type = getattr(robot.get_whole_body_status(), "urdf_type", "")
+            urdf_type = robot.get_whole_body_status().get("urdf_type", "")  # a dict
             if not urdf_type:
                 log.fatal("robot did not report its urdf_type; set parameter urdf_path")
                 return 1
@@ -429,6 +467,12 @@ class TorqueSubscriberNode(Node):
             return 0 if self.stop.is_set() else 1
         if self.stop.is_set():
             return 0
+        # ---- Right before taking control: the mode must still be the one to restore ----
+        mode_now = int(robot.get_motion_control_status().control_mode)
+        if mode_now != old_mode:
+            log.fatal(f"control mode changed from {old_mode} to {mode_now} while preparing "
+                      "(someone else operating the robot?); not entering mode 9")
+            return 1
         self._set_realtime()
         log.info(f"control mode {old_mode} -> 9 (direct torque). Do not touch the arms.")
         rc = 0
@@ -436,7 +480,9 @@ class TorqueSubscriberNode(Node):
         try:
             try:
                 robot.set_control_mode(MODE_JOINT_TORQUE)
-                robot.wait_control_mode(MODE_JOINT_TORQUE, 500)
+                robot.wait_control_mode(MODE_JOINT_TORQUE, MODE_SWITCH_TIMEOUT_MS)
+                if int(robot.get_motion_control_status().control_mode) != MODE_JOINT_TORQUE:
+                    raise TimeoutError("mode 9 not reported after wait_control_mode")
             except TimeoutError:
                 log.fatal("mode 9 not confirmed by the robot (arm under external force, "
                           "unregistered payload or failed force-control admission?)")
@@ -458,15 +504,28 @@ class TorqueSubscriberNode(Node):
                     rc = 3
                 log.info(f"torque loop ended after {self.frames} frames")
         finally:
-            # ---- Leave mode 9 ourselves: GDK never does it ----
+            # ---- Leave mode 9 ourselves: GDK never does it. Report it once the robot confirms ----
             self.phase = "restoring"
             try:
                 robot.set_control_mode(old_mode)
-                log.info(f"control mode restored to {old_mode}")
             except Exception as e:  # noqa: BLE001
                 log.error(f"set_control_mode({old_mode}) failed ({e!r}): restore the mode "
-                          "manually and check the robot's motion-control error state")
+                          "manually and check the robot's motion-control error state "
+                          "(ClearMotionControlError)")
                 rc = rc or 2
+            else:
+                try:
+                    robot.wait_control_mode(old_mode, MODE_SWITCH_TIMEOUT_MS)
+                    confirmed = int(robot.get_motion_control_status().control_mode) == old_mode
+                except Exception:  # noqa: BLE001  (TimeoutError or a failed status read)
+                    confirmed = False
+                if confirmed:
+                    log.info(f"control mode restored to {old_mode}")
+                else:
+                    log.error(f"control mode {old_mode} requested but not confirmed by the robot "
+                              f"within {MODE_SWITCH_TIMEOUT_MS} ms: check the mode and the "
+                              "motion-control error state (ClearMotionControlError)")
+                    rc = rc or 2
         return rc
 
     def _set_realtime(self):
@@ -478,21 +537,45 @@ class TorqueSubscriberNode(Node):
                 raise RuntimeError(msg) from e
             self.get_logger().warn(msg + "; continuing without real-time priority")
 
+    def _holding_torque_within_cap(self, effort):
+        """The node clamps every torque to the cap (effort_limit_scale * URDF effort limit) and
+        slews from the measured holding torque, so it can only take over arms whose holding
+        torque is inside the cap. False (logged) otherwise."""
+        cap = self.p["effort_limit_scale"] * self.model.effort_limits
+        over = np.flatnonzero(np.abs(effort) > cap)
+        if over.size:
+            i = int(over[0])
+            self.get_logger().fatal(
+                f"measured holding torque {effort[i]:.3f} Nm on {ARM_JOINT_NAMES[i]} exceeds the "
+                f"effort cap {cap[i]:.3f} Nm (effort_limit_scale {self.p['effort_limit_scale']:.3f}"
+                f" x URDF limit {self.model.effort_limits[i]:.3f} Nm): the node could not hold "
+                "the arm. Refusing to enter mode 9.")
+            return False
+        return True
+
     def _preflight_check(self, pos, vel, eff):
-        """Model gravity vs measured effort. Refuses the start only with gravity compensation on."""
+        """Model gravity vs measured effort. The state must be finite and the holding torque
+        inside the effort cap; the gravity difference refuses the start only with gravity
+        compensation on."""
         log = self.get_logger()
         self.model.set_state(pos, vel)
         g = self.model.gravity()
-        effort = self.model.arm(eff)
+        q, dq, effort = self.model.arm(pos), self.model.arm(vel), self.model.arm(eff)
         diff = g - effort
         lines = ["pre-flight: model gravity vs measured effort (Nm)"]
         for i, name in enumerate(ARM_JOINT_NAMES):
             lines.append(f"  {name:20s} g={g[i]:8.3f}  effort={effort[i]:8.3f}  diff={diff[i]:8.3f}")
         worst = float(np.max(np.abs(diff)))
         log.info("\n".join(lines) + f"\n  max |diff| = {worst:.3f} Nm")
-        speed = float(np.max(np.abs(self.model.arm(vel))))
+        speed = float(np.max(np.abs(dq)))
         if speed > 0.05:
             log.warn(f"arms are moving ({speed:.3f} rad/s): the gravity check is unreliable")
+        # Before any comparison: a NaN makes `worst` NaN, and NaN > tol is False.
+        if not (np.all(np.isfinite(q)) and np.all(np.isfinite(dq))
+                and np.all(np.isfinite(effort))):
+            log.fatal("the robot reports a non-finite arm joint position, velocity or effort "
+                      "(see the table); refusing to start")
+            return False
         if not np.all(np.isfinite(g)):
             log.fatal("dynamics model returned NaN/Inf")
             return False
@@ -502,13 +585,17 @@ class TorqueSubscriberNode(Node):
                       f"gravity_check_tolerance {tol:.3f} Nm: wrong URDF / payload / waist "
                       "posture? Refusing to enter mode 9.")
             return False
+        if not self._holding_torque_within_cap(effort):
+            return False
         # Fallback torque for an abort before the first loop frame (frame 0 re-seeds it).
-        self._prev_tau = effort.copy() if np.all(np.isfinite(effort)) else g
+        self._prev_tau = effort.copy()
         return True
 
     def _wait_for_commands(self, robot):
         """Gravity compensation off: wait until both arms are commanded and the first torque is
-        within gravity_check_tolerance of the holding torque (measured effort). False on stop."""
+        within gravity_check_tolerance of the holding torque (measured effort). The measured
+        state is published meanwhile, for controllers that need it to compute their first command
+        (no commanded / compensation torques yet). False on stop or invalid state."""
         log = self.get_logger()
         log.info("waiting for torque commands on both arms (full torque, gravity included) "
                  "before entering mode 9")
@@ -519,14 +606,22 @@ class TorqueSubscriberNode(Node):
             if not self.model.bind(names):
                 log.fatal("the robot state misses one of the 14 arm joints")
                 return False
+            q, dq, effort = self.model.arm(pos), self.model.arm(vel), self.model.arm(eff)
+            if not (np.all(np.isfinite(q)) and np.all(np.isfinite(dq))
+                    and np.all(np.isfinite(effort))):
+                log.fatal("the robot reports a non-finite arm joint position, velocity or "
+                          "effort; not entering mode 9")
+                return False
             self.model.set_state(pos, vel)
+            self._hand_off((names, pos, vel, eff, q, dq, effort, None, None))
             ext, ddq, fresh = self._latest_inputs()
             if all(fresh):
-                first = (self._model_torque(ddq) + ext
-                         - self.p["joint_damping"] * self.model.arm(vel))
-                diff = np.abs(first - self.model.arm(eff))
+                first = self._model_torque(ddq) + ext - self.p["joint_damping"] * dq
+                diff = np.abs(first - effort)
                 i = int(np.argmax(diff))
                 if tol <= 0.0 or diff[i] <= tol:
+                    if not self._holding_torque_within_cap(effort):
+                        return False
                     log.info(f"commands on both arms, within {diff[i]:.3f} Nm of the holding torque")
                     return True
                 log.warn(f"first torque differs from the holding torque by {diff[i]:.3f} Nm on "
@@ -593,6 +688,16 @@ class TorqueSubscriberNode(Node):
             self._abort("robot state misses an arm joint")
         q, dq, effort = self.model.arm(pos), self.model.arm(vel), self.model.arm(eff)
         self.model.set_state(pos, vel)
+        lim = self.p["effort_limit_scale"] * self.model.effort_limits
+        if self._first_frame:  # the robot compares frame 0 with its holding torque (~ effort)
+            self._prev_tau = (effort.copy() if np.all(np.isfinite(effort))
+                              else self.model.gravity().copy())
+            self._first_frame = False
+            over = np.flatnonzero(np.abs(self._prev_tau) > lim)  # checked before mode 9 too
+            if over.size:
+                i = int(over[0])
+                self._abort(f"holding torque {self._prev_tau[i]:.3f} Nm on {ARM_JOINT_NAMES[i]} "
+                            f"exceeds the effort cap {lim[i]:.3f} Nm")
         ext, ddq, fresh = self._latest_inputs()
         comp = self._model_torque(ddq)
         if not self.p["compensate_gravity"] and not self.p["dry_run"]:
@@ -601,14 +706,10 @@ class TorqueSubscriberNode(Node):
                     self._abort(f"{ARM_LABELS[arm]} arm: no torque command for "
                                 f"{self.p['command_timeout']:.3f} s and gravity compensation is "
                                 "off (zero torque would drop the arm)")
-        if self._first_frame:  # the robot compares frame 0 with its holding torque (~ effort)
-            self._prev_tau = (effort.copy() if np.all(np.isfinite(effort))
-                              else self.model.gravity().copy())
-            self._first_frame = False
-        lim = self.p["effort_limit_scale"] * self.model.effort_limits
         step = self.p["max_torque_step"]
         tau = np.clip(comp + ext - self.p["joint_damping"] * dq, -lim, lim)
         tau = self._prev_tau + np.clip(tau - self._prev_tau, -step, step)
+        tau = np.clip(tau, -lim, lim)  # no-op: tau_prev of frame 0 is inside the cap
 
         if not (np.all(np.isfinite(q)) and np.all(np.isfinite(dq))):
             self._abort("non-finite joint state")
@@ -622,14 +723,45 @@ class TorqueSubscriberNode(Node):
                             f"{vlim:.3f} rad/s")
         self._prev_tau = tau
         if self.frames % self.p["publish_decimation"] == 0:
-            self._publish(names, pos, vel, eff, q, dq, effort, tau, comp)
+            self._hand_off((names, pos, vel, eff, q, dq, effort, tau, comp))
         return tau
 
     def _abort(self, reason):
         self.abort_reason = reason
         raise Abort(reason)
 
+    # ------------------------------------------------------------------------------------------
+    # State publishing (publisher thread)
+    # ------------------------------------------------------------------------------------------
+    def _hand_off(self, sample):
+        """Give the publisher thread the latest sample; never waits (a busy publisher drops it).
+        The arrays in a sample are fresh per frame and never modified afterwards."""
+        if not self._pub_cv.acquire(blocking=False):
+            return
+        try:
+            self._pub_sample = sample
+            self._pub_cv.notify()
+        finally:
+            self._pub_cv.release()
+
+    def _publisher(self):
+        while True:
+            with self._pub_cv:
+                self._pub_cv.wait_for(lambda: self._pub_sample is not None or self._pub_stop)
+                if self._pub_stop:
+                    return
+                sample, self._pub_sample = self._pub_sample, None
+            self._publish(*sample)
+
+    def stop_publisher(self):
+        with self._pub_cv:
+            self._pub_stop = True
+            self._pub_cv.notify()
+        if self._pub_thread.is_alive():
+            self._pub_thread.join()
+
     def _publish(self, names, pos, vel, eff, q, dq, effort, tau, comp):
+        """tau / comp None: measured state only (waiting for commands)."""
         try:
             stamp = self.get_clock().now().to_msg()
             if self._joint_states_pub:
@@ -648,7 +780,7 @@ class TorqueSubscriberNode(Node):
                     self._arm_state_pubs[arm].publish(m)
             for pub, m, values in ((self._commanded_pub, self._cmd_msg, tau),
                                    (self._compensation_pub, self._comp_msg, comp)):
-                if pub:
+                if pub and values is not None:
                     m.header.stamp = stamp
                     m.position, m.velocity, m.effort = q.tolist(), dq.tolist(), values.tolist()
                     pub.publish(m)
@@ -697,6 +829,8 @@ def main(args=None):
         (node.get_logger() if node else rclpy.logging.get_logger("g2_torque_subscriber")).fatal(
             f"{e!r}")
     finally:
+        if node is not None:
+            node.stop_publisher()  # before the publishers go away with the node
         spin_stop.set()
         if spin_thread.is_alive():
             spin_thread.join()

@@ -24,7 +24,9 @@ the arm sags, and the pre-flight check refuses to start in that case.
        torque feedback: once the arm rests again, the measured effort of every joint whose g(q)
                         changed must have changed with the same sign (against it by >= 3 Nm:
                         FAIL, by less: WARN), and |effort - g| must stay within --gravity-tol on
-                        all joints. A move changes the gravity load mostly of the joints between
+                        all joints. An effort that changed by less than 1 Nm while g(q) changed
+                        by >= 3 Nm (stuck feedback), or a non-finite effort, is a FAIL too.
+                        A move changes the gravity load mostly of the joints between
                         the shoulder and the moved joint, so a flipped or swapped effort (or
                         position) shows up when moving the outer joints of a loaded arm (e.g.
                         elbow bent); an arm hanging straight down carries little load.
@@ -225,15 +227,24 @@ class JointCheck:
         fail, warn = [], []
         if moved != j:
             fail.append(f"{LABELS[moved]} moved, not {LABELS[j]}")
-        against = (np.abs(d_g) >= MIN_DG) & (d_eff * d_g < 0)
-        clearly = against & (np.abs(d_g) >= CLEAR_DG) & (np.abs(d_eff) >= MIN_DG)
-        if clearly.any():
-            fail.append(f"effort of {','.join(np.array(LABELS)[clearly])} changed against g(q)")
-        if (against & ~clearly).any():
-            warn.append(f"effort of {','.join(np.array(LABELS)[against & ~clearly])} changed "
-                        "slightly against g(q)")
-        if abs(resid[w]) > self.tol:
-            fail.append(f"|effort - g| > {self.tol:g} Nm")
+        if not all(np.all(np.isfinite(x)) for x in (eff, g, self.eff0, self.g0)):
+            # NaN would pass every comparison below: no valid torque feedback to judge.
+            fail.append("non-finite effort or g(q)")
+        else:
+            against = (np.abs(d_g) >= MIN_DG) & (d_eff * d_g < 0)
+            clearly = against & (np.abs(d_g) >= CLEAR_DG) & (np.abs(d_eff) >= MIN_DG)
+            # g(q) changed clearly but the effort barely did: stuck or missing feedback.
+            stuck = (np.abs(d_g) >= CLEAR_DG) & (np.abs(d_eff) < MIN_DG)
+            if clearly.any():
+                fail.append(f"effort of {','.join(np.array(LABELS)[clearly])} changed against "
+                            "g(q)")
+            if stuck.any():
+                fail.append(f"effort of {','.join(np.array(LABELS)[stuck])} did not follow g(q)")
+            if (against & ~clearly & ~stuck).any():
+                warn.append(f"effort of {','.join(np.array(LABELS)[against & ~clearly & ~stuck])} "
+                            "changed slightly against g(q)")
+            if abs(resid[w]) > self.tol:
+                fail.append(f"|effort - g| > {self.tol:g} Nm")
         if self.peak[runner] > AMBIGUOUS * self.peak[moved]:
             warn.append(f"{LABELS[runner]} moved too, hold the other links still and redo")
         result = "FAIL" if fail else "WARN" if warn else "PASS"
@@ -282,7 +293,7 @@ def run(robot, args):
     # ---- Dynamics model (Pinocchio). Needs a URDF that matches the robot. ----
     urdf = args.urdf
     if not urdf:
-        name = getattr(robot.get_whole_body_status(), "urdf_type", "")
+        name = robot.get_whole_body_status().get("urdf_type", "")  # the binding returns a dict
         if not name:
             print("urdf_type unavailable, pass the urdf path as argument", file=sys.stderr)
             return 1

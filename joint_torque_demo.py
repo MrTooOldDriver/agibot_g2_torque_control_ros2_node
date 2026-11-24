@@ -138,7 +138,7 @@ def reference(k, q_from, q_to):
 def run(robot, urdf):
     # ---- Dynamics model (Pinocchio wrapper). Needs a URDF that matches the robot. ----
     if not urdf:
-        name = getattr(robot.get_whole_body_status(), "urdf_type", "")
+        name = robot.get_whole_body_status().get("urdf_type", "")  # the binding returns a dict
         if not name:
             print("urdf_type unavailable, pass the urdf path as argument", file=sys.stderr)
             return 1

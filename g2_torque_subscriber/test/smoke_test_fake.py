@@ -4,14 +4,19 @@
   python3 smoke_test_fake.py --impl cpp --urdf /models/<g2>.urdf
   python3 smoke_test_fake.py --impl py  --urdf /models/<g2>.urdf
 
-Starts the node (backend:=fake, or the fake agibot_gdk for --impl py) three times:
+Starts the node (backend:=fake; for --impl py also the fake agibot_gdk first on PYTHONPATH) in a
+private namespace /g2_smoke_<pid>_<time>, so that the test commands (up to 15 Nm) can never reach
+a node driving the real robot in the same ROS domain (the container uses host networking):
   A. gravity + coriolis + inertia on: arms float; sent torque = g + C dq (+ M ddq_d) + command,
      each term checked against an independent Pinocchio model; timeout; rejected message; velocity
      abort with mode restore.
   B. gravity on, SIGINT: final frame, mode restored, exit 0.
-  C. all compensation off (the default): no mode 9 without commands, nor with commands far from
-     the holding torque (zeros); mode 9 once both arms send the full gravity torque; a missing
-     command then ends the loop (exit 3) and restores the mode.
+  C. all compensation off (the default): the measured state is published while the node waits;
+     no mode 9 (no ~/commanded_torques) without commands, nor with commands far from the holding
+     torque (zeros); mode 9 once both arms send the full gravity torque; a missing command then
+     ends the loop (exit 3) and restores the mode.
+  D. refusals before mode 9 (exit 1): measured holding torque above the effort cap
+     (effort_limit_scale); --impl py also: backend:=gdk with the fake agibot_gdk.
 """
 
 import argparse
@@ -29,7 +34,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 
-NS = "/g2_torque_subscriber"
+RUN_NS = f"/g2_smoke_{os.getpid()}_{int(time.time())}"  # private to this test run
+NS = RUN_NS + "/g2_torque_subscriber"
 # Bent arms (shoulder, elbow, wrist), so gravity torques are significant.
 DEFAULT_POSE = "0.3,0.4,0.2,-1.0,0.2,0.3,0.2,-0.3,-0.4,-0.2,-1.0,-0.2,-0.3,-0.2"
 POSE = np.array([float(x) for x in DEFAULT_POSE.split(",")])
@@ -40,10 +46,10 @@ ATOL = 1e-6
 
 class Probe(Node):
     def __init__(self):
-        super().__init__("smoke_probe")
+        super().__init__("smoke_probe", namespace=RUN_NS)
         self.msgs = {}
         for key, topic in (("left", NS + "/left/joint_states"), ("cmd", NS + "/commanded_torques"),
-                           ("comp", NS + "/compensation_torques"), ("full", "/joint_states")):
+                           ("comp", NS + "/compensation_torques"), ("full", RUN_NS + "/joint_states")):
             self.create_subscription(JointState, topic,
                                      lambda m, key=key: self.msgs.__setitem__(key, m), 10)
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -101,7 +107,7 @@ class Model:
         return np.asarray(pin.computeGeneralizedGravity(self.model, self.data, q))[iv].copy()
 
 
-def start_node(impl, urdf, params=()):
+def start_node(impl, urdf, params=(), backend="fake"):
     env = dict(os.environ)
     env.setdefault("G2_FAKE_INITIAL_POSE", DEFAULT_POSE)
     prefix = subprocess.check_output(["ros2", "pkg", "prefix", "g2_torque_subscriber"],
@@ -113,8 +119,8 @@ def start_node(impl, urdf, params=()):
         exe = [prefix + "/lib/g2_torque_subscriber/torque_subscriber_node.py"]
     else:
         exe = [prefix + "/lib/g2_torque_subscriber/torque_subscriber_node"]
-    cmd = exe + ["--ros-args", "-p", "backend:=fake", "-p", f"urdf_path:={urdf}",
-                 "-p", "publish_decimation:=5"]
+    cmd = exe + ["--ros-args", "-r", f"__ns:={RUN_NS}", "-p", f"backend:={backend}",
+                 "-p", f"urdf_path:={urdf}", "-p", "publish_decimation:=5"]
     for p in params:
         cmd += ["-p", p]
     return subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -213,15 +219,17 @@ def run_c(probe, model, a):
     print("--- C: all compensation off (default)")
     probe.reset()
     proc = start_node(a.impl, a.urdf)
-    probe.spin_for(1.5)
-    check("no commands: does not enter mode 9", "left" not in probe.msgs and proc.poll() is None)
+    # ~/commanded_torques only comes from the torque loop: its absence means "not in mode 9".
+    check("measured state published while waiting for commands", probe.wait_for("left", proc))
+    probe.spin_for(1.0)
+    check("no commands: does not enter mode 9", "cmd" not in probe.msgs and proc.poll() is None)
     zeros = np.zeros(7)
     probe.spin_for(1.0, left=zeros, right=zeros)
     check("zero commands (no gravity): does not enter mode 9",
-          "left" not in probe.msgs and proc.poll() is None)
+          "cmd" not in probe.msgs and proc.poll() is None)
     g0 = model.gravity_at(ARM_NAMES, POSE)
     probe.spin_for(1.5, left=g0[:7], right=g0[7:])
-    check("full gravity commands: enters mode 9 and streams", "left" in probe.msgs)
+    check("full gravity commands: enters mode 9 and streams", "cmd" in probe.msgs)
     if "cmd" in probe.msgs and "left" in probe.msgs:
         sent = np.array(probe.msgs["cmd"].effort)
         err = np.max(np.abs(sent - g0))
@@ -236,6 +244,26 @@ def run_c(probe, model, a):
     return out
 
 
+def run_d(probe, a):
+    print("--- D: refusals before mode 9")
+    probe.reset()
+    proc = start_node(a.impl, a.urdf, ["compensate_gravity:=true", "effort_limit_scale:=0.01"])
+    rc, out = finish(proc, timeout=30)
+    check("holding torque above the effort cap -> exit 1", rc == 1, f"rc={rc}")
+    check("effort cap refusal says why", "exceeds the effort cap" in out)
+    check("effort cap refusal: mode 9 never requested",
+          "-> 9" not in out and "cmd" not in probe.msgs)
+    outs = [out]
+    if a.impl == "py":  # the fake agibot_gdk is first on PYTHONPATH, the real GDK is asked for
+        proc = start_node(a.impl, a.urdf, ["compensate_gravity:=true"], backend="gdk")
+        rc, out = finish(proc, timeout=30)
+        check("backend:=gdk with the fake agibot_gdk -> exit 1 before connecting",
+              rc == 1 and "not connecting" in out and "connecting to the robot" not in out,
+              f"rc={rc}")
+        outs.append(out)
+    return "\n".join(outs)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--impl", choices=["cpp", "py"], default="cpp")
@@ -244,9 +272,9 @@ def main():
     rclpy.init()
     probe = Probe()
     model = Model(a.urdf)
-    outputs = [run_a(probe, model, a), run_b(probe, a), run_c(probe, model, a)]
+    outputs = [run_a(probe, model, a), run_b(probe, a), run_c(probe, model, a), run_d(probe, a)]
     if not all(results):
-        for label, out in zip("ABC", outputs):
+        for label, out in zip("ABCD", outputs):
             print(f"------ node output, run {label} ------\n{out}")
     probe.destroy_node()
     rclpy.shutdown()

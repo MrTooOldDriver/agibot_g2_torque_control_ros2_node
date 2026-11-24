@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Co-load check with the REAL GDK and no robot: the node (C++ and Python) must start, load the GDK
-# next to ROS 2 without crashing, keep its ROS interface alive while GDK connects, and exit
-# promptly on Ctrl+C. Run inside the container (GDK at /opt/agibot/app, workspace sourced):
+# Co-load check with the REAL GDK: the node (C++ and Python) must start, load the GDK next to ROS 2
+# without crashing, keep its ROS interface alive while GDK connects, and exit promptly on Ctrl+C.
+# The node runs with dry_run:=true, so it never switches the control mode or sends torque, and the
+# check is also safe on the robot's own computer, where the GDK really connects. Run it inside the
+# container (docker/run.sh: GDK mounted and sourced, workspace sourced):
 #   bash src/g2_torque_subscriber/test/coload_check.sh /models/<g2>.urdf
 set -u
 URDF=${1:?usage: coload_check.sh <urdf>}
@@ -12,8 +14,8 @@ for rmw in rmw_fastrtps_cpp rmw_cyclonedds_cpp; do
     exe=$PREFIX/lib/g2_torque_subscriber/torque_subscriber_node
     [ "$impl" = py ] && exe=$exe.py
     log=$(mktemp)
-    RMW_IMPLEMENTATION=$rmw setsid "$exe" --ros-args -p backend:=gdk -p urdf_path:="$URDF" \
-      > "$log" 2>&1 &
+    RMW_IMPLEMENTATION=$rmw setsid "$exe" --ros-args -p backend:=gdk -p dry_run:=true \
+      -p urdf_path:="$URDF" > "$log" 2>&1 &
     pid=$!
     sleep 6
     alive=no; kill -0 $pid 2> /dev/null && alive=yes

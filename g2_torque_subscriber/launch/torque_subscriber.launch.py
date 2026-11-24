@@ -61,7 +61,8 @@ def generate_launch_description():
         DeclareLaunchArgument("urdf_path", default_value="",
                               description="URDF of the dynamics model (overrides params_file)"),
         DeclareLaunchArgument("backend", default_value="",
-                              description="C++ only: gdk | fake | <module path>"),
+                              description="gdk | fake (C++ also: <module path>). Python: "
+                                          "must match the agibot_gdk on PYTHONPATH"),
         DeclareLaunchArgument("dry_run", default_value="",
                               description="true: never switch mode or send torque"),
         DeclareLaunchArgument("compensate_gravity", default_value="",

@@ -1,5 +1,7 @@
-# Vendor SDK (large binaries; mount or copy it locally, see README)
-agibot_gdk/
+# Vendor SDK (large binaries; mount or copy it locally, see README). Anchored to the repo
+# root: test/fake_gdk/agibot_gdk/ is the fake GDK and must stay tracked.
+/agibot_gdk/
+/agibot.zip
 # Container workspace (colcon build / install / log)
 docker/ws/
 build/

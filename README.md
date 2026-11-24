@@ -1,6 +1,80 @@
 # agibot_g2_torque_control_ros2_node
 
-## Check the robot connection
+The node can run in two places:
+
+- **On the robot's own computer** (`agi@10.42.1.101`). This is the vendor's current instruction
+  and the only setup tested on the robot so far. See
+  [Run on the robot's computer](#run-on-the-robots-computer).
+- **On a dev PC wired to the robot as 10.42.1.102.** The rest of this README describes this
+  setup. With the robot's current GDK config, the robot sends its torque-mode state to itself
+  (10.42.1.101:8852), so a dev PC probably receives nothing.
+
+## Run on the robot's computer
+
+The robot's computer is a Jetson Thor running Ubuntu 24.04 (aarch64, Python 3.12). The GDK is
+installed at `/home/agi/app`. `docker/run.sh` detects the robot and switches to its robot
+profile:
+
+| | Robot profile |
+|---|---|
+| Image | ROS 2 **Jazzy**, arm64 (`g2-torque-subscriber:jazzy`, built on first use, needs internet). The robot's GDK needs glibc 2.38 and `GLIBCXX_3.4.32`, so Humble (Ubuntu 22.04) cannot load it. |
+| GDK | `/home/agi/app`, mounted read-only at the same path. The vendor's paths (URDF, `cosine_ipc.prototxt`) therefore work unchanged in the container. The entrypoint sets `COSINE_BUS_CONFIG_PATH` and `COSINE_BUS_ENABLE_TOPIC_CONFIG_MERGE=1`, as in the vendor's instructions. |
+| State stream | UDP to `10.42.1.101:8852`, on the robot itself. |
+| User | The container always runs as root, like the vendor demo (`sudo su`), because the robot services' `/dev/shm` segments are root-only. `agi` is not in the `docker` group, so use `sudo docker/run.sh`. `docker/ws` ends up owned by root. |
+| Other mounts | `/data` read-only (the GDK reads `/data/version` and `/data/parameters`) and `/data/logs` writable (the GDK's `LOG_PATH`). |
+| CPUs | Docker uses the systemd cgroup driver, so containers inherit the robot's `system.slice` cpuset (CPUs 11-13). These are the same CPUs as the vendor demo run from ssh. The robot's isolated real-time CPUs stay untouched. The kernel is PREEMPT_RT with RT throttling off (`sched_rt_runtime_us=-1`), one more reason for the low priority cap. |
+| Real time | `--ulimit rtprio=15`, no `CAP_SYS_NICE`. The GDK runs the torque loop at SCHED_FIFO 10. The robot's own control threads run at 20 and above (EtherCAT 20, `servo_server` 52, `hal-loop` 99), and nothing in the container can outrank them. The Python node's request for priority 80 falls back to normal priority with a warning. |
+| ROS | `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`, so DDS stays off the robot's internal networks. Run the command publisher on the robot too, in a second `sudo docker/run.sh`. Keep `ROS_DOMAIN_ID` away from 4, the domain of the robot's own DDS. The GDK's `run.conf` sets `FASTDDS_DEFAULT_PROFILES_FILE` (domain 4, robot interfaces only). Only the GDK's Fast DDS 3 reads it; ROS's Fast DDS 2.14 reads `FASTRTPS_DEFAULT_PROFILES_FILE`. |
+
+Both implementations should work here, because the robot's GDK binding is CPython 3.12, which
+matches Jazzy. They have been checked on Jazzy only on the PC, with the x86 GDK and no robot:
+- built against Pinocchio 4.1;
+- smoke tests pass for both implementations;
+- the C++ co-load check passes with `rmw_fastrtps` and with `rmw_cyclonedds`.
+
+The Python co-load check cannot run there, because the x86 binding is CPython 3.10. The first
+on-robot build is the first aarch64 build.
+
+```bash
+# On the PC: copy the repo to the robot. This excludes the x86 GDK, the zip and the PC build.
+rsync -a --delete --exclude .git --exclude /agibot_gdk --exclude /agibot.zip --exclude /docker/ws \
+  ./ agi@10.42.1.101:g2_torque/
+
+# On the robot (ssh agi@10.42.1.101)
+cd ~/g2_torque
+ls /home/agi/app/gdk/build_dep/cpp/aarch64/include       # GDK headers: expect common/ and gdk/
+sudo docker/run.sh colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+#   the CMake output must say "GDK: /home/agi/app (aarch64)"
+
+U=/home/agi/app/share/genie_robot_description/urdf/G2_t2_crsB/G2_t2_crsB.urdf
+
+# Read-only checks. Neither one switches the control mode or sends torque.
+sudo docker/run.sh bash -c 'echo $LOCATOR_IP $AORTA_DISCOVERY_URI $COSINE_BUS_CONFIG_PATH'
+#   expect: 10.42.1.101 http://10.42.1.101:2379 /home/agi/app/conf/dds/cosine_ipc.prototxt
+sudo docker/run.sh bash src/g2_torque_subscriber/test/coload_check.sh $U    # GDK next to ROS 2
+sudo docker/run.sh ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true urdf_path:=$U
+#   with the arms at rest, the gravity table's diff column must be small
+
+# Real run: the arms move. Clear the area and keep the e-stop in reach.
+sudo docker/run.sh ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=$U \
+  compensate_gravity:=true
+# Second ssh session: commands, as in Quick start
+sudo docker/run.sh ros2 topic pub -r 500 --qos-reliability best_effort \
+  /g2_torque_subscriber/left/external_torques std_msgs/msg/Float64MultiArray "{data: [0, 0, 0, 0, 0, 0, 0]}"
+```
+
+- **The robot build fails on missing GDK headers:** copy
+  `agibot_gdk/app/gdk/build_dep/cpp/aarch64/include` from the PC. It is the same GDK version
+  (`snap-direct-torque-mode-1102-1`).
+- **The first real run logs `JointTorqueControl returned kTimeout`:** the vendor's on-robot script
+  uses `state_timeout_ms=500` rather than the default 100. Set it in
+  `config/torque_subscriber.yaml`. With `--symlink-install`, no rebuild is needed.
+- **Watch the state stream during a real run:** run `sudo tcpdump -ni any udp port 8852 -c 20` on
+  the robot.
+- **To skip sudo:** `sudo usermod -aG docker agi`, then log in again. The container still runs as
+  root. Membership in the `docker` group is root-equivalent anyway.
+
+## Check the robot connection (dev PC)
 
 Run this before the first launch. Steps 1 and 2 are read-only: the robot never enters torque mode.
 
@@ -70,7 +144,7 @@ Direct joint torque control of the **AGIBOT G2** arms from ROS 2 topics: the G2 
 `TorqueSubscriberController` in the franka_ros2 fork (`~/franka_ros2`,
 `franka_example_controllers/src/torque_subscriber_controller.cpp`). There are two implementations
 with the same interface: C++ (`torque_subscriber_node`) and Python (`torque_subscriber_node.py`).
-Both run in a ROS 2 Humble container.
+Both run in a ROS 2 container: Humble on the dev PC, Jazzy on the robot's computer.
 
 | | Franka `TorqueSubscriberController` | G2 `g2_torque_subscriber` |
 |---|---|---|
@@ -88,8 +162,9 @@ tau = [compensate_gravity]  g(q)                                  gravity
     + [compensate_coriolis] C(q, dq) dq                           Coriolis + centrifugal
     + [compensate_inertia]  M(q) ddq_d                            inertia feed-forward
     + tau_ext - joint_damping * dq
-tau = clamp(tau, +- effort_limit_scale * URDF effort limit)
+tau = clamp(tau, +- cap)                                          cap = effort_limit_scale * URDF effort limit
 tau = tau_prev + clamp(tau - tau_prev, +- max_torque_step)       tau_prev of frame 0 = measured effort (robot's holding torque)
+tau = clamp(tau, +- cap)                                          no-op: the holding torque must be inside the cap (pre-flight)
 ```
 
 The three terms are those of the vendor demo's `rnea(q, dq, ddq_d) = M ddq_d + C dq + g`:
@@ -119,28 +194,41 @@ Default node name `g2_torque_subscriber` (`~` = `/<namespace>/g2_torque_subscrib
 
 Arm joints: left `idx21_arm_l_joint1` … `idx27_arm_l_joint7`, right `idx61_arm_r_joint1` …
 `idx67_arm_r_joint7`. The publishers are reliable and publish every `publish_decimation`-th frame
-(default: every frame, 1 kHz). All parameters, with comments, are in
+(default: every frame, 1 kHz) from a separate thread, so a publish never delays the torque write.
+While the node waits for commands (`compensate_gravity` off), the measured states (`joint_states`
+and `~/<arm>/joint_states`) are already published at about 100 Hz, so a controller can compute its
+first full-torque command from them. `~/commanded_torques` and `~/compensation_torques` start with
+the torque loop. All parameters, with comments, are in
 [`g2_torque_subscriber/config/torque_subscriber.yaml`](g2_torque_subscriber/config/torque_subscriber.yaml).
 
 ## Lifecycle and safety
 
 1. Connect (GDK), load the URDF, and read one state frame.
 2. Pre-flight: the node checks that all 14 arm joints are present and prints model gravity g(q)
-   against the measured effort. With `compensate_gravity` on, it refuses to start if they differ by
-   more than `gravity_check_tolerance` (10 Nm). A wrong URDF, an unregistered payload or a wrong
-   waist pose would otherwise cause drift or the 50 Nm step e-stop.
+   against the measured effort. It refuses to start (exit 1) if:
+   - an arm joint's position, velocity or effort is not finite;
+   - the measured holding torque of a joint is above the effort cap (`effort_limit_scale` × URDF
+     limit). The node could not hold that arm, and its first torque would exceed the cap.
+   - with `compensate_gravity` on, g(q) and the effort differ by more than
+     `gravity_check_tolerance` (10 Nm). A wrong URDF, an unregistered payload or a wrong waist pose
+     would otherwise cause drift or the 50 Nm step e-stop.
 3. Remember the control mode. The node refuses to start if the robot is already in mode 9.
 4. **With `compensate_gravity` off only:** wait until both arms are commanded and the first torque
    is within `gravity_check_tolerance` of the measured holding torque. Commands that leave out
-   gravity therefore never reach the robot.
-5. Switch to mode 9 and wait for confirmation. **Do not touch the arms while entering.**
+   gravity therefore never reach the robot. The measured states are published meanwhile.
+5. Read the mode again. If it is no longer the remembered one (someone else is operating the
+   robot), refuse. Otherwise switch to mode 9 and wait until the robot reports it. **Do not touch
+   the arms while entering.**
 6. 1 kHz loop. Abort (final frame, then step 7) on any of these:
    - a joint faster than `velocity_limit` (2 rad/s);
    - a non-finite state or torque;
    - a GDK read timeout or error;
    - with `compensate_gravity` off, an arm without a command for `command_timeout`.
 7. **Restore the previous control mode** (the robot then holds the arms) and exit. Ctrl+C, SIGTERM,
-   `docker stop`, aborts and errors all take this path. GDK never leaves mode 9 by itself.
+   `docker stop`, aborts and errors all take this path. GDK never leaves mode 9 by itself. The node
+   logs `control mode restored to <mode>` only once the robot reports that mode (500 ms wait).
+   Otherwise it logs an error and exits 2: check the mode, and clear an e-stop with
+   `ClearMotionControlError()`.
 
 Robot-side limits that still apply (from the GDK docs):
 
@@ -163,11 +251,17 @@ This was reproduced on the host. The C++ node therefore never links the GDK. It 
 real GDK and keep their ROS interface working (`test/coload_check.sh`). This was verified without a
 robot only, so the GDK's own bus never came up next to ROS.
 
-## Setup (ROS 2 Humble container)
+## Setup (dev PC, ROS 2 Humble container)
 
-The GDK's Python binding is CPython 3.10 only, and the robot streams its state to
-`10.42.1.102:8852/UDP`. The machine needs a direct 10 GbE link to the robot's debug port with IP
-10.42.1.102, and the container uses host networking.
+For the robot's own computer, see [Run on the robot's computer](#run-on-the-robots-computer).
+`docker/run.sh` picks the right profile by itself. On the PC:
+- The x86 GDK's Python binding is CPython 3.10, hence Humble.
+- The GDK docs have the robot stream its state to `10.42.1.102:8852/UDP`. The machine therefore
+  needs a direct 10 GbE link to the robot's debug port with IP 10.42.1.102.
+- The container uses host networking.
+
+After pulling changes to `docker/`, rebuild the image with `docker rmi g2-torque-subscriber:humble`;
+`run.sh` then rebuilds it on the next start.
 
 ```bash
 # Build the image (ros:humble-ros-base + pinocchio + cyclonedds) and the workspace.
@@ -212,7 +306,9 @@ ros2 topic pub -r 500 --qos-reliability best_effort /g2_torque_subscriber/left/e
   std_msgs/msg/Float64MultiArray "{data: [0, 0, 0, 2.0, 0, 0, 0]}"
 ```
 
-For real-time priority, the container already has `--ulimit rtprio=99 --cap-add SYS_NICE`; set
+For real-time priority, the PC container already has `--ulimit rtprio=99 --cap-add SYS_NICE`.
+The robot profile deliberately caps it at 15; see
+[Run on the robot's computer](#run-on-the-robots-computer). Set
 `enforce_realtime:=true` to fail rather than warn when SCHED_FIFO is unavailable. Python at 1 kHz
 is best effort. If it struggles, raise `publish_decimation`.
 
@@ -226,20 +322,25 @@ export G2_FAKE_URDF=/models/<g2>.urdf
 # C++
 ros2 launch g2_torque_subscriber torque_subscriber.launch.py backend:=fake urdf_path:=$G2_FAKE_URDF \
   compensate_gravity:=true
-# Python: put the fake agibot_gdk first on PYTHONPATH
+# Python: put the fake agibot_gdk first on PYTHONPATH AND pass backend:=fake. The Python node
+# refuses to connect when the imported agibot_gdk is not the one backend names, so a mistyped
+# PYTHONPATH can never turn a rehearsal into a run on the real robot.
 PYTHONPATH=$(ros2 pkg prefix g2_torque_subscriber)/share/g2_torque_subscriber/fake_gdk:$PYTHONPATH \
-  ros2 launch g2_torque_subscriber torque_subscriber.launch.py impl:=py urdf_path:=$G2_FAKE_URDF \
-  compensate_gravity:=true
+  ros2 launch g2_torque_subscriber torque_subscriber.launch.py impl:=py backend:=fake \
+  urdf_path:=$G2_FAKE_URDF compensate_gravity:=true
 ```
 
 ## Tests (no robot needed, run inside the container)
 
 ```bash
-# End-to-end against the simulated arms, 21 checks:
+# End-to-end against the simulated arms, 25 checks (26 with --impl py). The nodes run in a private
+# namespace (/g2_smoke_<pid>_<time>), so the test commands never reach a live node.
 #  - all three terms on: each term against an independent Pinocchio model, timeout, rejected
 #    messages, velocity abort and SIGINT, each with mode restore;
-#  - all off: no mode 9 without commands or with commands that leave out gravity; mode 9 with
-#    full-torque commands; abort and mode restore when they stop.
+#  - all off: measured states while waiting; no mode 9 without commands or with commands that
+#    leave out gravity; mode 9 with full-torque commands; abort and mode restore when they stop;
+#  - refusals before mode 9: holding torque above the effort cap, and (Python) backend:=gdk with
+#    the fake agibot_gdk.
 # The fake plant uses the same URDF as the node, so this tests the plumbing, not whether the URDF
 # matches the robot. That is what the on-robot dry-run table is for.
 python3 src/g2_torque_subscriber/test/smoke_test_fake.py --impl cpp --urdf /models/<g2>.urdf
@@ -261,6 +362,6 @@ g2_torque_subscriber/
   test/fake_gdk/agibot_gdk/            fake GDK Python module
   config/torque_subscriber.yaml        parameters (shared by both nodes)
   launch/torque_subscriber.launch.py   impl:=cpp|py, dry_run, backend, urdf_path, compensate_*
-docker/                                Humble image, entrypoint, run.sh
+docker/                                image (Humble on the PC, Jazzy on the robot), entrypoint, run.sh
 joint_torque_demo.py                   vendor example the torque handling follows
 ```

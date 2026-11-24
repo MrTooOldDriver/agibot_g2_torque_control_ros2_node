@@ -51,23 +51,16 @@ DynamicsModel::DynamicsModel(const std::string& urdf_path) {
 }
 
 bool DynamicsModel::Bind(const JointFrame& frame) {
-  const std::size_t n = frame.names.size();
-  if (bound_size_ == n && n > 0) {
-    bool same = true;
-    for (std::size_t i = 0; i < kArmDof && same; ++i) {
-      same = arm_frame_idx_[i] < n && frame.names[arm_frame_idx_[i]] == kArmJointNames[i];
-    }
-    if (same) return true;
-  }
+  // Same layout as the bound one: every name, not only the arm joints, so that a reordering of the
+  // waist / head joints cannot leave a stale index (wrong waist pose in g(q)). No allocation.
+  if (!bound_names_.empty() && frame.names == bound_names_) return true;
   // Layout changed (or first frame): rebuild the index. Allocates, but only on layout changes.
+  bound_names_.clear();
   std::unordered_map<std::string, std::size_t> index;
-  for (std::size_t i = 0; i < n; ++i) index[frame.names[i]] = i;
+  for (std::size_t i = 0; i < frame.names.size(); ++i) index[frame.names[i]] = i;
   for (std::size_t i = 0; i < kArmDof; ++i) {
     const auto it = index.find(kArmJointNames[i]);
-    if (it == index.end()) {
-      bound_size_ = 0;
-      return false;
-    }
+    if (it == index.end()) return false;
     arm_frame_idx_[i] = it->second;
   }
   bound_others_.clear();
@@ -75,7 +68,7 @@ bool DynamicsModel::Bind(const JointFrame& frame) {
     const auto it = index.find(o.name);
     if (it != index.end()) bound_others_.push_back({it->second, o.idx_q, o.idx_v});
   }
-  bound_size_ = n;
+  bound_names_ = frame.names;
   return true;
 }
 

@@ -9,8 +9,10 @@
 //       + [compensate_coriolis] C(q, dq) dq        (measured velocities, waist/head included)
 //       + [compensate_inertia]  M(q) ddq_d         (ddq_d from ~/<arm>/desired_accelerations)
 //       + tau_ext - joint_damping * dq             (14 arm joints, Nm)
-//   tau = clamp(tau, +-effort_limit_scale * URDF effort limit)
+//   tau = clamp(tau, +-cap)                 cap = effort_limit_scale * URDF effort limit
 //   tau = tau_prev + clamp(tau - tau_prev, +-max_torque_step)   (tau_prev of frame 0 = measured effort)
+//   tau = clamp(tau, +-cap)                 (no-op: the measured holding torque must be inside the
+//                                            cap, the node refuses to start otherwise)
 //
 // With compensate_gravity on, a command means what it means on a Franka (torque on top of gravity
 // compensation) and a timed-out arm keeps the compensation terms (tau_ext = 0, the arm floats).
@@ -23,10 +25,12 @@
 // The ROS executor runs on the main thread; commands are handed over under a mutex, as in the
 // Franka controller. Joint states are published by a third thread so ROS never blocks the loop.
 //
-// Lifecycle: connect -> load URDF -> pre-flight check -> remember the control mode -> (gravity
-// off: wait for commands) -> mode 9 -> torque loop -> restore the previous mode -> exit. Ctrl+C,
-// a GDK error or a safety abort all leave through the same "restore the previous mode" path. If
-// the loop ends for any reason the node shuts down (restart it to re-enter mode 9).
+// Lifecycle: connect -> load URDF -> pre-flight check (finite state, holding torque inside the
+// effort cap, gravity model) -> remember the control mode -> (gravity off: wait for commands,
+// publishing the measured state) -> the mode must still be the remembered one -> mode 9
+// (confirmed) -> torque loop -> restore the previous mode (confirmed) -> exit. Ctrl+C, a GDK error
+// or a safety abort all leave through the same "restore the previous mode" path. If the loop ends
+// for any reason the node shuts down (restart it to re-enter mode 9).
 
 #include <dlfcn.h>
 
@@ -61,6 +65,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using Float64MultiArray = std_msgs::msg::Float64MultiArray;
 constexpr std::array<const char*, 2> kArmLabels = {"left", "right"};
+constexpr int kModeSwitchTimeoutMs = 500;  // WaitControlMode when entering and leaving mode 9
 
 enum Phase : int { kIdle, kConnecting, kPreparing, kStreaming, kRestoring, kDone };
 
@@ -400,6 +405,19 @@ class TorqueSubscriberNode : public rclcpp::Node {
     // ---- Gravity compensation off: the commands must hold the arms before mode 9 ----
     if (!p_.compensate_gravity && !WaitForCommands()) return stop_requested_ ? 0 : 1;
     if (stop_requested_) return 0;
+    // ---- Right before taking control: the mode must still be the one to restore ----
+    int mode_now = -1;
+    if (!backend_->GetControlMode(mode_now)) {
+      RCLCPP_FATAL(get_logger(), "cannot read the control mode");
+      return 1;
+    }
+    if (mode_now != old_mode) {
+      RCLCPP_FATAL(get_logger(),
+                   "control mode changed from %d to %d while preparing (someone else operating "
+                   "the robot?); not entering mode 9",
+                   old_mode, mode_now);
+      return 1;
+    }
 
     // ---- Enter mode 9. From the first SetControlMode(9) on, every exit restores old_mode ----
     RCLCPP_INFO(get_logger(), "control mode %d -> 9 (direct torque). Do not touch the arms.",
@@ -408,7 +426,8 @@ class TorqueSubscriberNode : public rclcpp::Node {
     if (!backend_->SetControlMode(kModeJointTorque)) {
       RCLCPP_FATAL(get_logger(), "SetControlMode(9) failed");
       rc = 1;
-    } else if (!backend_->WaitControlMode(kModeJointTorque, 500)) {
+    } else if (!backend_->WaitControlMode(kModeJointTorque, kModeSwitchTimeoutMs) ||
+               !ModeIs(kModeJointTorque)) {
       RCLCPP_FATAL(get_logger(),
                    "mode 9 not confirmed by the robot (arm under external force, unregistered "
                    "payload or failed force-control admission?)");
@@ -434,22 +453,53 @@ class TorqueSubscriberNode : public rclcpp::Node {
                   static_cast<unsigned long long>(frame_count_));
     }
 
-    // ---- Leave mode 9 ourselves: GDK never does it ----
+    // ---- Leave mode 9 ourselves: GDK never does it. Report it only once the robot confirms ----
     phase_ = kRestoring;
-    if (backend_->SetControlMode(old_mode)) {
-      RCLCPP_INFO(get_logger(), "control mode restored to %d", old_mode);
-    } else {
+    if (!backend_->SetControlMode(old_mode)) {
       RCLCPP_ERROR(get_logger(),
                    "SetControlMode(%d) failed: restore the mode manually and check the robot's "
                    "motion-control error state (ClearMotionControlError)",
                    old_mode);
       rc = rc ? rc : 2;
+    } else if (!backend_->WaitControlMode(old_mode, kModeSwitchTimeoutMs) || !ModeIs(old_mode)) {
+      RCLCPP_ERROR(get_logger(),
+                   "control mode %d requested but not confirmed by the robot within %d ms: check "
+                   "the mode and the motion-control error state (ClearMotionControlError)",
+                   old_mode, kModeSwitchTimeoutMs);
+      rc = rc ? rc : 2;
+    } else {
+      RCLCPP_INFO(get_logger(), "control mode restored to %d", old_mode);
     }
     return rc;
   }
 
-  // Model gravity vs measured effort with the arms at rest. With gravity compensation on, a large
-  // difference (wrong URDF / payload / waist pose) refuses the start; with it off the table is
+  bool ModeIs(int mode) {
+    int now = -1;
+    return backend_->GetControlMode(now) && now == mode;
+  }
+
+  // The node clamps every torque to the cap (effort_limit_scale * URDF effort limit) and slews
+  // from the measured holding torque, so it can only take over arms whose holding torque is
+  // inside the cap. False (logged) otherwise.
+  bool HoldingTorqueWithinCap(const ArmVector& effort) {
+    const ArmVector& limit = model_->EffortLimits();
+    for (std::size_t i = 0; i < kArmDof; ++i) {
+      const double cap = p_.effort_limit_scale * limit[i];
+      if (std::abs(effort[i]) > cap) {
+        RCLCPP_FATAL(get_logger(),
+                     "measured holding torque %.3f Nm on %s exceeds the effort cap %.3f Nm "
+                     "(effort_limit_scale %.3f x URDF limit %.3f Nm): the node could not hold "
+                     "the arm. Refusing to enter mode 9.",
+                     effort[i], kArmJointNames[i], cap, p_.effort_limit_scale, limit[i]);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Model gravity vs measured effort with the arms at rest. The state must be finite and the
+  // holding torque inside the effort cap. With gravity compensation on, a large difference
+  // (wrong URDF / payload / waist pose) also refuses the start; with it off the table is
   // informational (the commands carry gravity, see WaitForCommands).
   bool PreflightCheck(const JointFrame& frame) {
     ArmVector q{}, dq{}, effort{};
@@ -473,6 +523,12 @@ class TorqueSubscriberNode : public rclcpp::Node {
       RCLCPP_WARN(get_logger(), "arms are moving (%.3f rad/s): the gravity check is unreliable",
                   max_speed);
     }
+    // Before any comparison: a NaN would drop out of `worst` and pass the tolerance check.
+    if (!AllFinite(q) || !AllFinite(dq) || !AllFinite(effort)) {
+      RCLCPP_FATAL(get_logger(), "the robot reports a non-finite arm joint position, velocity or "
+                   "effort (see the table); refusing to start");
+      return false;
+    }
     if (!AllFinite(g)) {
       RCLCPP_FATAL(get_logger(), "dynamics model returned NaN/Inf");
       return false;
@@ -486,19 +542,22 @@ class TorqueSubscriberNode : public rclcpp::Node {
                    worst, p_.gravity_check_tolerance);
       return false;
     }
+    if (!HoldingTorqueWithinCap(effort)) return false;
     // Fallback torque for an abort before the first loop frame (frame 0 re-seeds it).
-    prev_tau_ = AllFinite(effort) ? effort : g;
+    prev_tau_ = effort;
     return true;
   }
 
   // Gravity compensation off: the commands carry the full torque, so the arms drop without them.
   // Wait (before mode 9) until both arms are commanded and the first torque is within
-  // gravity_check_tolerance of the holding torque (measured effort). False on stop / read error.
+  // gravity_check_tolerance of the holding torque (measured effort). The measured state is
+  // published meanwhile, for controllers that need it to compute their first command (no
+  // commanded / compensation torques yet). False on stop, read error or invalid state.
   bool WaitForCommands() {
     RCLCPP_INFO(get_logger(), "waiting for torque commands on both arms (full torque, gravity "
                 "included) before entering mode 9");
     JointFrame frame;
-    ArmVector q{}, dq{}, effort{}, ext{}, ddq{}, comp{};
+    ArmVector ext{}, ddq{};
     std::array<bool, 2> fresh{};
     auto next = Clock::now();
     while (!stop_requested_ && rclcpp::ok()) {
@@ -506,21 +565,28 @@ class TorqueSubscriberNode : public rclcpp::Node {
         RCLCPP_FATAL(get_logger(), "cannot read the robot joint states");
         return false;
       }
-      model_->Extract(frame, q, dq, effort);
+      model_->Extract(frame, q_, dq_, effort_);
+      if (!AllFinite(q_) || !AllFinite(dq_) || !AllFinite(effort_)) {
+        RCLCPP_FATAL(get_logger(), "the robot reports a non-finite arm joint position, velocity "
+                     "or effort; not entering mode 9");
+        return false;
+      }
       model_->SetState(frame);
+      HandOffState(frame, nullptr);
       LatestInputs(ext, ddq, fresh);
       if (fresh[0] && fresh[1]) {
-        ModelTorque(ddq, comp);
+        ModelTorque(ddq, comp_);
         double worst = 0.0;
         std::size_t worst_i = 0;
         for (std::size_t i = 0; i < kArmDof; ++i) {
-          const double d = std::abs(comp[i] + ext[i] - p_.joint_damping * dq[i] - effort[i]);
+          const double d = std::abs(comp_[i] + ext[i] - p_.joint_damping * dq_[i] - effort_[i]);
           if (d > worst) {
             worst = d;
             worst_i = i;
           }
         }
         if (p_.gravity_check_tolerance <= 0.0 || worst <= p_.gravity_check_tolerance) {
+          if (!HoldingTorqueWithinCap(effort_)) return false;
           RCLCPP_INFO(get_logger(), "commands on both arms, within %.3f Nm of the holding torque",
                       worst);
           return true;
@@ -591,6 +657,21 @@ class TorqueSubscriberNode : public rclcpp::Node {
     model_->Extract(frame, q_, dq_, effort_);
     model_->SetState(frame);
 
+    const ArmVector& limit = model_->EffortLimits();
+    if (first_frame_) {  // the robot compares frame 0 with its holding torque (~ measured effort)
+      prev_tau_ = AllFinite(effort_) ? effort_ : model_->Gravity();
+      first_frame_ = false;
+      for (std::size_t i = 0; i < kArmDof; ++i) {  // checked before mode 9 too; the arms may differ now
+        const double cap = p_.effort_limit_scale * limit[i];
+        if (std::abs(prev_tau_[i]) > cap) {
+          std::snprintf(abort_reason_, sizeof(abort_reason_),
+                        "holding torque %.3f Nm on %s exceeds the effort cap %.3f Nm",
+                        prev_tau_[i], kArmJointNames[i], cap);
+          return Abort(nullptr, tau);
+        }
+      }
+    }
+
     ArmVector ext{}, ddq{};
     std::array<bool, 2> fresh{};
     LatestInputs(ext, ddq, fresh);
@@ -607,17 +688,12 @@ class TorqueSubscriberNode : public rclcpp::Node {
       }
     }
 
-    if (first_frame_) {  // the robot compares frame 0 with its holding torque (~ measured effort)
-      prev_tau_ = AllFinite(effort_) ? effort_ : model_->Gravity();
-      first_frame_ = false;
-    }
-    const ArmVector& limit = model_->EffortLimits();
     for (std::size_t i = 0; i < kArmDof; ++i) {
       const double lim = p_.effort_limit_scale * limit[i];
       double t = comp_[i] + ext[i] - p_.joint_damping * dq_[i];
       t = std::clamp(t, -lim, lim);
       t = prev_tau_[i] + std::clamp(t - prev_tau_[i], -p_.max_torque_step, p_.max_torque_step);
-      tau[i] = t;
+      tau[i] = std::clamp(t, -lim, lim);  // no-op: tau_prev of frame 0 is inside the cap
     }
 
     if (!AllFinite(q_) || !AllFinite(dq_)) return Abort("non-finite joint state", tau);
@@ -633,7 +709,7 @@ class TorqueSubscriberNode : public rclcpp::Node {
       }
     }
     prev_tau_ = tau;
-    HandOffState(frame, tau);
+    if (frame_count_ % static_cast<uint64_t>(p_.publish_decimation) == 0) HandOffState(frame, &tau);
     return stop_requested_.load();
   }
 
@@ -686,6 +762,7 @@ class TorqueSubscriberNode : public rclcpp::Node {
   struct StateSnapshot {
     JointFrame frame;
     ArmVector q{}, dq{}, effort{}, tau{}, comp{};
+    bool has_torques{false};  // tau / comp valid (torque loop or dry run, not while waiting)
     bool fresh{false};
   };
 
@@ -694,8 +771,9 @@ class TorqueSubscriberNode : public rclcpp::Node {
     snapshot_.frame = frame;  // size the buffers once, outside the loop
   }
 
-  void HandOffState(const JointFrame& frame, const ArmVector& tau) {
-    if (frame_count_ % static_cast<uint64_t>(p_.publish_decimation) != 0) return;
+  // Hand the measured state (q_, dq_, effort_ of `frame`) and, unless tau is null, the commanded
+  // torque and comp_ over to the publisher thread.
+  void HandOffState(const JointFrame& frame, const ArmVector* tau) {
     {
       std::unique_lock<std::mutex> lock(state_mutex_, std::try_to_lock);
       if (!lock.owns_lock()) return;  // publisher busy: skip this sample
@@ -707,8 +785,11 @@ class TorqueSubscriberNode : public rclcpp::Node {
       snapshot_.q = q_;
       snapshot_.dq = dq_;
       snapshot_.effort = effort_;
-      snapshot_.tau = tau;
-      snapshot_.comp = comp_;
+      snapshot_.has_torques = tau != nullptr;
+      if (tau) {
+        snapshot_.tau = *tau;
+        snapshot_.comp = comp_;
+      }
       snapshot_.fresh = true;
     }
     state_cv_.notify_one();
@@ -760,7 +841,7 @@ class TorqueSubscriberNode : public rclcpp::Node {
         }
         for (auto* pm : {&cmd_msg, &comp_msg}) {
           auto& pub = pm == &cmd_msg ? commanded_pub_ : compensation_pub_;
-          if (!pub) continue;
+          if (!pub || !local.has_torques) continue;
           const ArmVector& effort = pm == &cmd_msg ? local.tau : local.comp;
           pm->header.stamp = stamp;
           pm->position.assign(local.q.begin(), local.q.end());
