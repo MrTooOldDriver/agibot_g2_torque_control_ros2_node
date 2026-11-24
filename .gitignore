@@ -1,0 +1,9 @@
+# Vendor SDK (large binaries; mount or copy it locally, see README)
+agibot_gdk/
+# Container workspace (colcon build / install / log)
+docker/ws/
+build/
+install/
+log/
+__pycache__/
+*.pyc

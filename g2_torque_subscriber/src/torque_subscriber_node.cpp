@@ -1,0 +1,693 @@
+// G2 torque subscriber: direct joint torque control of the AGIBOT G2 arms from ROS 2 topics.
+//
+// The G2 counterpart of franka_example_controllers/TorqueSubscriberController. Each arm listens on
+// its own topic (std_msgs/Float64MultiArray, 7 values, joint1..joint7), like one Franka controller
+// per arm. A command is the torque ADDED ON TOP OF GRAVITY COMPENSATION, exactly the meaning it has
+// on a Franka (libfranka adds gravity internally):
+//
+//   tau = g(q) + tau_ext - joint_damping * dq                  (14 arm joints, Nm)
+//   tau = clamp(tau, +-effort_limit_scale * URDF effort limit)
+//   tau = tau_prev + clamp(tau - tau_prev, +-max_torque_step)   (tau_prev of frame 0 = measured effort)
+//
+// Unlike the Franka controller, a timed-out arm does NOT get zero torque: in G2 mode 9 the robot
+// does no gravity compensation, so zero total torque would drop the arm (and could trip the 50 Nm
+// step e-stop). Instead tau_ext of that arm becomes zero and gravity compensation continues, which
+// is what a zero command means on a Franka.
+//
+// The 1 kHz loop runs on its own thread (GDK JointTorqueControl: read frame -> compute -> write).
+// The ROS executor runs on the main thread; commands are handed over under a mutex, as in the
+// Franka controller. Joint states are published by a third thread so ROS never blocks the loop.
+//
+// Lifecycle: connect -> load URDF -> pre-flight gravity check -> remember the control mode ->
+// mode 9 -> torque loop -> restore the previous mode -> exit. Ctrl+C, a GDK error or a safety
+// abort all leave through the same "restore the previous mode" path. If the loop ends for any
+// reason the node shuts down (restart it to re-enter mode 9).
+
+#include <dlfcn.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <ament_index_cpp/get_package_prefix.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
+
+#include "g2_torque_subscriber/gravity_model.hpp"
+#include "g2_torque_subscriber/robot_backend.hpp"
+
+namespace g2_torque_subscriber {
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+constexpr std::array<const char*, 2> kArmLabels = {"left", "right"};
+
+enum Phase : int { kIdle, kConnecting, kPreparing, kStreaming, kRestoring, kDone };
+
+struct Params {
+  std::string backend;                   // "gdk", "fake" or a path to a backend module
+  std::string urdf_path;                 // URDF for gravity compensation ("" = ask the robot)
+  std::string urdf_dir;                  // where <urdf_type>/<urdf_type>.urdf lives
+  std::array<std::string, 2> torque_topics;
+  std::array<std::string, 2> arm_state_topics;
+  std::string joint_states_topic;
+  std::string commanded_torques_topic;
+  int publish_decimation{1};
+  double command_timeout{0.1};           // s
+  double max_torque_step{15.0};          // Nm per frame
+  double effort_limit_scale{1.0};
+  double joint_damping{0.0};             // Nm*s/rad
+  double velocity_limit{2.0};            // rad/s, 0 = off
+  double gravity_check_tolerance{10.0};  // Nm, 0 = off
+  bool dry_run{false};
+  double dry_run_rate{100.0};            // Hz
+  bool enforce_realtime{false};
+  int state_timeout_ms{100};
+};
+
+bool AllFinite(const ArmVector& v) {
+  return std::all_of(v.begin(), v.end(), [](double x) { return std::isfinite(x); });
+}
+
+}  // namespace
+
+class TorqueSubscriberNode : public rclcpp::Node {
+ public:
+  explicit TorqueSubscriberNode(const rclcpp::NodeOptions& options)
+      : rclcpp::Node("g2_torque_subscriber", options) {
+    DeclareParameters();
+
+    // Same QoS as the Franka torque subscriber: KeepLast(1), BestEffort, Volatile.
+    const auto cmd_qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
+    for (std::size_t arm = 0; arm < 2; ++arm) {
+      subs_[arm] = create_subscription<std_msgs::msg::Float64MultiArray>(
+          p_.torque_topics[arm], cmd_qos,
+          [this, arm](const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
+            OnArmCommand(arm, *msg);
+          });
+    }
+    // Reliable publishers match both reliable and best-effort subscribers.
+    const auto state_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().durability_volatile();
+    if (!p_.joint_states_topic.empty()) {
+      joint_states_pub_ =
+          create_publisher<sensor_msgs::msg::JointState>(p_.joint_states_topic, state_qos);
+    }
+    for (std::size_t arm = 0; arm < 2; ++arm) {
+      if (!p_.arm_state_topics[arm].empty()) {
+        arm_state_pubs_[arm] =
+            create_publisher<sensor_msgs::msg::JointState>(p_.arm_state_topics[arm], state_qos);
+      }
+    }
+    if (!p_.commanded_torques_topic.empty()) {
+      commanded_pub_ =
+          create_publisher<sensor_msgs::msg::JointState>(p_.commanded_torques_topic, state_qos);
+    }
+    status_timer_ = create_wall_timer(std::chrono::milliseconds(100), [this] { StatusTick(); });
+
+    RCLCPP_INFO(get_logger(),
+                "G2 torque subscriber: left '%s', right '%s' (7 values each, Nm on top of gravity "
+                "compensation; QoS KeepLast(1)/BestEffort/Volatile), timeout %.3f s%s",
+                subs_[0]->get_topic_name(), subs_[1]->get_topic_name(), p_.command_timeout,
+                p_.dry_run ? ", DRY RUN (nothing is sent to the robot)" : "");
+  }
+
+  ~TorqueSubscriberNode() override {
+    stop_requested_ = true;
+    StopPublisherThread();
+    if (control_thread_.joinable()) control_thread_.join();
+  }
+
+  void Start() {
+    publisher_thread_ = std::thread([this] { PublisherThread(); });
+    control_thread_ = std::thread([this] {
+      int rc = 1;
+      try {
+        rc = RunControl();
+      } catch (const std::exception& e) {
+        RCLCPP_FATAL(get_logger(), "control thread: %s", e.what());
+      }
+      phase_ = kDone;
+      exit_code_.set_value(rc);
+      if (rclcpp::ok()) rclcpp::shutdown();  // the robot is no longer under our control
+    });
+  }
+
+  void RequestStop() { stop_requested_ = true; }
+
+  // Wait for the control thread to restore the control mode and finish. Returns its exit code.
+  int Join() {
+    auto fut = exit_code_.get_future();
+    const auto t0 = Clock::now();
+    while (fut.wait_for(std::chrono::seconds(1)) != std::future_status::ready) {
+      if (phase_ == kConnecting && Clock::now() - t0 > std::chrono::seconds(3)) {
+        // Still inside GDKInit / Robot(): no mode was changed yet, nothing to clean up.
+        RCLCPP_ERROR(get_logger(), "GDK still connecting (robot not reachable?); exiting");
+        std::fflush(nullptr);
+        std::_Exit(1);
+      }
+      RCLCPP_INFO(get_logger(), "waiting for the torque loop to stop and the mode to be restored");
+    }
+    const int rc = fut.get();
+    StopPublisherThread();
+    if (control_thread_.joinable()) control_thread_.join();
+    return rc;
+  }
+
+ private:
+  // --------------------------------------------------------------------------------------------
+  // Parameters
+  // --------------------------------------------------------------------------------------------
+  void DeclareParameters() {
+    p_.backend = declare_parameter<std::string>("backend", "gdk");
+    p_.urdf_path = declare_parameter<std::string>("urdf_path", "");
+    p_.urdf_dir = declare_parameter<std::string>(
+        "urdf_dir", "/home/agi/app/share/genie_robot_description/urdf");
+    p_.torque_topics[0] =
+        declare_parameter<std::string>("left_torque_topic", "~/left/external_torques");
+    p_.torque_topics[1] =
+        declare_parameter<std::string>("right_torque_topic", "~/right/external_torques");
+    p_.arm_state_topics[0] =
+        declare_parameter<std::string>("left_joint_states_topic", "~/left/joint_states");
+    p_.arm_state_topics[1] =
+        declare_parameter<std::string>("right_joint_states_topic", "~/right/joint_states");
+    p_.joint_states_topic = declare_parameter<std::string>("joint_states_topic", "joint_states");
+    p_.commanded_torques_topic =
+        declare_parameter<std::string>("commanded_torques_topic", "~/commanded_torques");
+    p_.publish_decimation =
+        std::max<int>(1, declare_parameter<int>("publish_decimation", p_.publish_decimation));
+    p_.command_timeout = declare_parameter<double>("command_timeout", p_.command_timeout);
+    p_.max_torque_step = declare_parameter<double>("max_torque_step", p_.max_torque_step);
+    p_.effort_limit_scale = declare_parameter<double>("effort_limit_scale", p_.effort_limit_scale);
+    p_.joint_damping = declare_parameter<double>("joint_damping", p_.joint_damping);
+    p_.velocity_limit = declare_parameter<double>("velocity_limit", p_.velocity_limit);
+    p_.gravity_check_tolerance =
+        declare_parameter<double>("gravity_check_tolerance", p_.gravity_check_tolerance);
+    p_.dry_run = declare_parameter<bool>("dry_run", p_.dry_run);
+    p_.dry_run_rate = declare_parameter<double>("dry_run_rate", p_.dry_run_rate);
+    p_.enforce_realtime = declare_parameter<bool>("enforce_realtime", p_.enforce_realtime);
+    p_.state_timeout_ms = declare_parameter<int>("state_timeout_ms", p_.state_timeout_ms);
+
+    if (p_.max_torque_step <= 0.0 || p_.max_torque_step >= 50.0) {
+      throw std::invalid_argument("max_torque_step must be in (0, 50) Nm (robot e-stops at 50)");
+    }
+    if (p_.effort_limit_scale <= 0.0 || p_.effort_limit_scale > 1.0) {
+      throw std::invalid_argument("effort_limit_scale must be in (0, 1]");
+    }
+    if (p_.command_timeout <= 0.0) throw std::invalid_argument("command_timeout must be > 0");
+    if (p_.dry_run_rate <= 0.0) throw std::invalid_argument("dry_run_rate must be > 0");
+    command_timeout_ = std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(p_.command_timeout));
+  }
+
+  // --------------------------------------------------------------------------------------------
+  // Command subscription (executor thread)
+  // --------------------------------------------------------------------------------------------
+  void OnArmCommand(std::size_t arm, const std_msgs::msg::Float64MultiArray& msg) {
+    if (msg.data.size() != kJointsPerArm) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
+                            "%s arm: torque command with %zu elements, expected %zu; ignored",
+                            kArmLabels[arm], msg.data.size(), kJointsPerArm);
+      return;
+    }
+    if (!std::all_of(msg.data.begin(), msg.data.end(), [](double x) { return std::isfinite(x); })) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
+                            "%s arm: torque command contains NaN/Inf; ignored", kArmLabels[arm]);
+      return;
+    }
+    std::lock_guard<std::mutex> lock(cmd_mutex_);
+    std::copy(msg.data.begin(), msg.data.end(), cmds_[arm].tau.begin());
+    cmds_[arm].stamp = Clock::now();
+    cmds_[arm].valid = true;
+  }
+
+  // 10 Hz: report when an arm's command stream starts or times out.
+  void StatusTick() {
+    const auto now = Clock::now();
+    std::array<bool, 2> fresh{};
+    {
+      std::lock_guard<std::mutex> lock(cmd_mutex_);
+      for (std::size_t arm = 0; arm < 2; ++arm) {
+        fresh[arm] = cmds_[arm].valid && now - cmds_[arm].stamp < command_timeout_;
+      }
+    }
+    for (std::size_t arm = 0; arm < 2; ++arm) {
+      if (fresh[arm] != was_fresh_[arm]) {
+        if (fresh[arm]) {
+          RCLCPP_INFO(get_logger(), "%s arm: receiving torque commands", kArmLabels[arm]);
+        } else {
+          RCLCPP_WARN(get_logger(),
+                      "%s arm: no torque command for %.3f s -> external torque 0 "
+                      "(gravity compensation only)",
+                      kArmLabels[arm], p_.command_timeout);
+        }
+        was_fresh_[arm] = fresh[arm];
+      }
+    }
+  }
+
+  // --------------------------------------------------------------------------------------------
+  // Control thread
+  // --------------------------------------------------------------------------------------------
+  int RunControl() {
+    phase_ = kConnecting;
+    std::string error;
+    if (!LoadBackend(error)) {
+      RCLCPP_FATAL(get_logger(), "%s", error.c_str());
+      return 1;
+    }
+    RCLCPP_INFO(get_logger(), "backend '%s': connecting to the robot", backend_->Name().c_str());
+    BackendOptions options;
+    options.urdf_path = p_.urdf_path;
+    if (!backend_->Connect(options, error)) {
+      RCLCPP_FATAL(get_logger(), "%s", error.c_str());
+      return 1;
+    }
+    phase_ = kPreparing;
+    const int rc = PrepareAndRun();
+    backend_->Disconnect();
+    return rc;
+  }
+
+  int PrepareAndRun() {
+    // ---- Dynamics model ----
+    std::string urdf = p_.urdf_path;
+    if (urdf.empty()) {
+      std::string type;
+      if (!backend_->GetUrdfType(type) || type.empty()) {
+        RCLCPP_FATAL(get_logger(), "robot did not report its urdf_type; set parameter urdf_path");
+        return 1;
+      }
+      urdf = p_.urdf_dir + "/" + type + "/" + type + ".urdf";
+    }
+    try {
+      model_ = std::make_unique<GravityModel>(urdf);
+    } catch (const std::exception& e) {
+      RCLCPP_FATAL(get_logger(), "%s", e.what());
+      return 1;
+    }
+    RCLCPP_INFO(get_logger(), "gravity model: %s", urdf.c_str());
+
+    // ---- Pre-flight: state stream alive, all arm joints present, gravity model plausible ----
+    JointFrame frame;
+    if (!backend_->ReadJointStates(frame)) {
+      RCLCPP_FATAL(get_logger(), "cannot read the robot joint states");
+      return 1;
+    }
+    if (!model_->Bind(frame)) {
+      RCLCPP_FATAL(get_logger(), "the robot state misses one of the 14 arm joints");
+      return 1;
+    }
+    if (!GravityCheck(frame)) return 1;
+    InitStateBuffers(frame);
+
+    if (p_.dry_run) return RunDryRun();
+
+    // ---- Remember the control mode, then enter mode 9 ----
+    int old_mode = -1;
+    if (!backend_->GetControlMode(old_mode)) {
+      RCLCPP_FATAL(get_logger(), "cannot read the control mode");
+      return 1;
+    }
+    if (old_mode == kModeJointTorque) {
+      RCLCPP_FATAL(get_logger(),
+                   "robot is already in mode 9 (a previous run did not exit cleanly?); cannot "
+                   "tell which mode to restore. Switch it to mode 3 first.");
+      return 1;
+    }
+    if (stop_requested_) return 0;
+    RCLCPP_INFO(get_logger(), "control mode %d -> 9 (direct torque). Do not touch the arms.",
+                old_mode);
+    // From the first SetControlMode(9) on, every exit goes through the restore below.
+    int rc = 0;
+    if (!backend_->SetControlMode(kModeJointTorque)) {
+      RCLCPP_FATAL(get_logger(), "SetControlMode(9) failed");
+      rc = 1;
+    } else if (!backend_->WaitControlMode(kModeJointTorque, 500)) {
+      RCLCPP_FATAL(get_logger(),
+                   "mode 9 not confirmed by the robot (arm under external force, unregistered "
+                   "payload or failed force-control admission?)");
+      rc = 1;
+    } else {
+      phase_ = kStreaming;
+      RCLCPP_INFO(get_logger(), "torque loop running (1 kHz)");
+      std::string error;
+      const bool ok = backend_->RunTorqueLoop(
+          [this](const JointFrame& f, uint64_t period_ns, ArmVector& tau) {
+            return OnFrame(f, period_ns, tau);
+          },
+          p_.enforce_realtime, p_.state_timeout_ms, error);
+      if (!ok) {
+        RCLCPP_ERROR(get_logger(), "torque loop failed: %s", error.c_str());
+        rc = 2;
+      }
+      if (aborted_) {
+        RCLCPP_ERROR(get_logger(), "safety abort: %s", abort_reason_);
+        rc = 3;
+      }
+      RCLCPP_INFO(get_logger(), "torque loop ended after %llu frames",
+                  static_cast<unsigned long long>(frame_count_));
+    }
+
+    // ---- Leave mode 9 ourselves: GDK never does it ----
+    phase_ = kRestoring;
+    if (backend_->SetControlMode(old_mode)) {
+      RCLCPP_INFO(get_logger(), "control mode restored to %d", old_mode);
+    } else {
+      RCLCPP_ERROR(get_logger(),
+                   "SetControlMode(%d) failed: restore the mode manually and check the robot's "
+                   "motion-control error state (ClearMotionControlError)",
+                   old_mode);
+      rc = rc ? rc : 2;
+    }
+    return rc;
+  }
+
+  bool GravityCheck(const JointFrame& frame) {
+    ArmVector q{}, dq{}, effort{};
+    model_->Extract(frame, q, dq, effort);
+    const ArmVector& g = model_->Gravity(frame);
+    double worst = 0.0, max_speed = 0.0;
+    std::ostringstream os;
+    os << "pre-flight: model gravity vs measured effort (Nm)\n";
+    for (std::size_t i = 0; i < kArmDof; ++i) {
+      const double diff = g[i] - effort[i];
+      worst = std::max(worst, std::abs(diff));
+      max_speed = std::max(max_speed, std::abs(dq[i]));
+      char line[128];
+      std::snprintf(line, sizeof(line), "  %-20s g=%8.3f  effort=%8.3f  diff=%8.3f\n",
+                    kArmJointNames[i], g[i], effort[i], diff);
+      os << line;
+    }
+    RCLCPP_INFO(get_logger(), "%s  max |diff| = %.3f Nm", os.str().c_str(), worst);
+    if (max_speed > 0.05) {
+      RCLCPP_WARN(get_logger(), "arms are moving (%.3f rad/s): the gravity check is unreliable",
+                  max_speed);
+    }
+    if (!AllFinite(g)) {
+      RCLCPP_FATAL(get_logger(), "gravity model returned NaN/Inf");
+      return false;
+    }
+    // Fallback torque for an abort before the first loop frame (frame 0 re-seeds it).
+    prev_tau_ = AllFinite(effort) ? effort : g;
+    if (p_.gravity_check_tolerance > 0.0 && worst > p_.gravity_check_tolerance) {
+      RCLCPP_FATAL(get_logger(),
+                   "gravity model differs from the measured effort by %.3f Nm > "
+                   "gravity_check_tolerance %.3f Nm: wrong URDF / payload / waist posture? "
+                   "Refusing to enter mode 9.",
+                   worst, p_.gravity_check_tolerance);
+      return false;
+    }
+    return true;
+  }
+
+  int RunDryRun() {
+    phase_ = kStreaming;
+    RCLCPP_INFO(get_logger(), "dry run: reading states at %.0f Hz, computing torques, sending "
+                "nothing, never switching the control mode", p_.dry_run_rate);
+    const auto period = std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(1.0 / p_.dry_run_rate));
+    const auto period_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(period).count());
+    JointFrame frame;
+    ArmVector tau{};
+    auto next = Clock::now();
+    while (!stop_requested_ && rclcpp::ok()) {
+      if (!backend_->ReadJointStates(frame)) {
+        RCLCPP_ERROR(get_logger(), "cannot read the robot joint states");
+        return 2;
+      }
+      if (OnFrame(frame, frame_count_ ? period_ns : 0, tau) && aborted_) {
+        RCLCPP_ERROR(get_logger(), "dry run: safety abort would trigger: %s", abort_reason_);
+        return 3;
+      }
+      next += period;
+      std::this_thread::sleep_until(next);
+    }
+    return 0;
+  }
+
+  // One frame of the torque law. Runs at 1 kHz on the loop thread: no logging, no allocation.
+  bool OnFrame(const JointFrame& frame, uint64_t /*period_ns*/, ArmVector& tau) {
+    ++frame_count_;
+    if (!model_->Bind(frame)) return Abort("robot state misses an arm joint", tau);
+    model_->Extract(frame, q_, dq_, effort_);
+    const ArmVector& g = model_->Gravity(frame);
+
+    ArmVector ext{};
+    const auto now = Clock::now();
+    {
+      std::lock_guard<std::mutex> lock(cmd_mutex_);
+      for (std::size_t arm = 0; arm < 2; ++arm) {
+        if (cmds_[arm].valid && now - cmds_[arm].stamp < command_timeout_) {
+          std::copy(cmds_[arm].tau.begin(), cmds_[arm].tau.end(),
+                    ext.begin() + arm * kJointsPerArm);
+        }
+      }
+    }
+
+    if (first_frame_) {  // the robot compares frame 0 with its holding torque (~ measured effort)
+      prev_tau_ = AllFinite(effort_) ? effort_ : g;
+      first_frame_ = false;
+    }
+    const ArmVector& limit = model_->EffortLimits();
+    for (std::size_t i = 0; i < kArmDof; ++i) {
+      const double lim = p_.effort_limit_scale * limit[i];
+      double t = g[i] + ext[i] - p_.joint_damping * dq_[i];
+      t = std::clamp(t, -lim, lim);
+      t = prev_tau_[i] + std::clamp(t - prev_tau_[i], -p_.max_torque_step, p_.max_torque_step);
+      tau[i] = t;
+    }
+
+    if (!AllFinite(q_) || !AllFinite(dq_)) return Abort("non-finite joint state", tau);
+    if (!AllFinite(tau)) return Abort("non-finite torque", tau);
+    if (p_.velocity_limit > 0.0) {
+      for (std::size_t i = 0; i < kArmDof; ++i) {
+        if (std::abs(dq_[i]) > p_.velocity_limit) {
+          std::snprintf(abort_reason_, sizeof(abort_reason_),
+                        "%s at %.3f rad/s > velocity_limit %.3f rad/s", kArmJointNames[i], dq_[i],
+                        p_.velocity_limit);
+          return Abort(nullptr, tau);
+        }
+      }
+    }
+    prev_tau_ = tau;
+    HandOffState(frame, tau);
+    return stop_requested_.load();
+  }
+
+  // Make this the final frame: repeat the last torque that was sent (finite, within the step
+  // limit); the control thread then restores the previous mode, which holds the arms.
+  bool Abort(const char* reason, ArmVector& tau) {
+    if (reason) std::snprintf(abort_reason_, sizeof(abort_reason_), "%s", reason);
+    tau = prev_tau_;
+    aborted_ = true;
+    return true;
+  }
+
+  bool LoadBackend(std::string& error) {
+    std::string lib = p_.backend;
+    if (lib == "gdk" || lib == "fake") {
+      try {
+        lib = ament_index_cpp::get_package_prefix("g2_torque_subscriber") +
+              "/lib/g2_torque_subscriber/libg2_" + lib + "_backend.so";
+      } catch (const std::exception& e) {
+        error = std::string("cannot locate the package: ") + e.what();
+        return false;
+      }
+    }
+    // RTLD_LOCAL | RTLD_DEEPBIND: keep the GDK's bundled Fast DDS 3 / boost / protobuf out of the
+    // global symbol scope that ROS uses, and make the GDK prefer its own copies (robot_backend.hpp).
+    backend_handle_ = dlopen(lib.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
+    if (!backend_handle_) {
+      error = std::string("cannot load backend: ") + dlerror();
+      if (p_.backend == "gdk") {
+        error += "\n  Was the GDK found when building (GDK_APP_DIR)? Did you source the GDK "
+                 "env.sh in this shell?";
+      }
+      return false;
+    }
+    auto create = reinterpret_cast<G2CreateRobotBackendFn>(
+        dlsym(backend_handle_, G2_BACKEND_FACTORY_SYMBOL));
+    if (!create) {
+      error = "backend " + lib + " has no " + G2_BACKEND_FACTORY_SYMBOL;
+      return false;
+    }
+    backend_.reset(create());
+    // The module is never dlclose()d: the GDK keeps threads and static state.
+    return backend_ != nullptr;
+  }
+
+  // --------------------------------------------------------------------------------------------
+  // State publishing: the loop hands a snapshot over (try_lock, never blocks); a separate thread
+  // publishes it.
+  // --------------------------------------------------------------------------------------------
+  struct StateSnapshot {
+    JointFrame frame;
+    ArmVector q{}, dq{}, effort{}, tau{};
+    bool fresh{false};
+  };
+
+  void InitStateBuffers(const JointFrame& frame) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    snapshot_.frame = frame;  // size the buffers once, outside the loop
+  }
+
+  void HandOffState(const JointFrame& frame, const ArmVector& tau) {
+    if (frame_count_ % static_cast<uint64_t>(p_.publish_decimation) != 0) return;
+    {
+      std::unique_lock<std::mutex> lock(state_mutex_, std::try_to_lock);
+      if (!lock.owns_lock()) return;  // publisher busy: skip this sample
+      snapshot_.frame.timestamp_ns = frame.timestamp_ns;
+      if (snapshot_.frame.names != frame.names) snapshot_.frame.names = frame.names;
+      snapshot_.frame.position = frame.position;
+      snapshot_.frame.velocity = frame.velocity;
+      snapshot_.frame.effort = frame.effort;
+      snapshot_.q = q_;
+      snapshot_.dq = dq_;
+      snapshot_.effort = effort_;
+      snapshot_.tau = tau;
+      snapshot_.fresh = true;
+    }
+    state_cv_.notify_one();
+  }
+
+  void PublisherThread() {
+    StateSnapshot local;
+    sensor_msgs::msg::JointState full_msg, cmd_msg;
+    std::array<sensor_msgs::msg::JointState, 2> arm_msgs;
+    for (std::size_t arm = 0; arm < 2; ++arm) {
+      auto& m = arm_msgs[arm];
+      for (std::size_t j = 0; j < kJointsPerArm; ++j) {
+        m.name.emplace_back(kArmJointNames[arm * kJointsPerArm + j]);
+      }
+      m.position.resize(kJointsPerArm);
+      m.velocity.resize(kJointsPerArm);
+      m.effort.resize(kJointsPerArm);
+    }
+    cmd_msg.name.assign(kArmJointNames.begin(), kArmJointNames.end());
+    while (true) {
+      {
+        std::unique_lock<std::mutex> lock(state_mutex_);
+        state_cv_.wait(lock, [this] { return snapshot_.fresh || publisher_stop_; });
+        if (publisher_stop_) return;
+        std::swap(local, snapshot_);
+        snapshot_.fresh = false;
+      }
+      if (!rclcpp::ok()) continue;
+      try {
+        const auto stamp = now();
+        if (joint_states_pub_) {
+          full_msg.header.stamp = stamp;
+          full_msg.name = local.frame.names;
+          full_msg.position = local.frame.position;
+          full_msg.velocity = local.frame.velocity;
+          full_msg.effort = local.frame.effort;
+          joint_states_pub_->publish(full_msg);
+        }
+        for (std::size_t arm = 0; arm < 2; ++arm) {
+          if (!arm_state_pubs_[arm]) continue;
+          auto& m = arm_msgs[arm];
+          m.header.stamp = stamp;
+          const std::size_t o = arm * kJointsPerArm;
+          std::copy_n(local.q.begin() + o, kJointsPerArm, m.position.begin());
+          std::copy_n(local.dq.begin() + o, kJointsPerArm, m.velocity.begin());
+          std::copy_n(local.effort.begin() + o, kJointsPerArm, m.effort.begin());
+          arm_state_pubs_[arm]->publish(m);
+        }
+        if (commanded_pub_) {
+          cmd_msg.header.stamp = stamp;
+          cmd_msg.position.assign(local.q.begin(), local.q.end());
+          cmd_msg.velocity.assign(local.dq.begin(), local.dq.end());
+          cmd_msg.effort.assign(local.tau.begin(), local.tau.end());
+          commanded_pub_->publish(cmd_msg);
+        }
+      } catch (const std::exception& e) {  // e.g. context shut down while publishing
+        if (rclcpp::ok()) RCLCPP_WARN(get_logger(), "publish failed: %s", e.what());
+      }
+    }
+  }
+
+  void StopPublisherThread() {
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      publisher_stop_ = true;
+    }
+    state_cv_.notify_all();
+    if (publisher_thread_.joinable()) publisher_thread_.join();
+  }
+
+  // --------------------------------------------------------------------------------------------
+  Params p_;
+  Clock::duration command_timeout_{};
+
+  struct ArmCommand {
+    std::array<double, kJointsPerArm> tau{};
+    Clock::time_point stamp{};
+    bool valid{false};
+  };
+  std::mutex cmd_mutex_;
+  std::array<ArmCommand, 2> cmds_{};
+  std::array<bool, 2> was_fresh_{};
+
+  std::array<rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr, 2> subs_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_states_pub_;
+  std::array<rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr, 2> arm_state_pubs_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr commanded_pub_;
+  rclcpp::TimerBase::SharedPtr status_timer_;
+
+  void* backend_handle_{nullptr};
+  std::unique_ptr<RobotBackend> backend_;
+  std::unique_ptr<GravityModel> model_;
+
+  // Loop-thread state
+  ArmVector q_{}, dq_{}, effort_{}, prev_tau_{};
+  bool first_frame_{true};
+  uint64_t frame_count_{0};
+  std::atomic<bool> aborted_{false};
+  char abort_reason_[256] = {};
+
+  std::atomic<bool> stop_requested_{false};
+  std::atomic<int> phase_{kIdle};
+  std::promise<int> exit_code_;
+  std::thread control_thread_;
+
+  std::mutex state_mutex_;
+  std::condition_variable state_cv_;
+  StateSnapshot snapshot_;
+  bool publisher_stop_{false};
+  std::thread publisher_thread_;
+};
+
+}  // namespace g2_torque_subscriber
+
+int main(int argc, char** argv) {
+  rclcpp::init(argc, argv);
+  int rc = 1;
+  try {
+    auto node = std::make_shared<g2_torque_subscriber::TorqueSubscriberNode>(rclcpp::NodeOptions());
+    node->Start();
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(node);
+    executor.spin();     // returns on Ctrl+C or when the control thread shuts ROS down
+    node->RequestStop();  // final frame, then the previous control mode is restored
+    rc = node->Join();
+  } catch (const std::exception& e) {
+    RCLCPP_FATAL(rclcpp::get_logger("g2_torque_subscriber"), "%s", e.what());
+  }
+  if (rclcpp::ok()) rclcpp::shutdown();
+  return rc;
+}
