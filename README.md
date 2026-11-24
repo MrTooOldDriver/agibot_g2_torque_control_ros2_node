@@ -9,6 +9,22 @@ The node can run in two places:
   setup. With the robot's current GDK config, the robot sends its torque-mode state to itself
   (10.42.1.101:8852), so a dev PC probably receives nothing.
 
+**Robot model.** The confirmed URDF for this robot is
+[`g2_torque_subscriber/urdf/genie_g2_crs_omnipicker.urdf`](g2_torque_subscriber/urdf/genie_g2_crs_omnipicker.urdf),
+which includes the omnipicker grippers. It is installed with the package and is the default
+`urdf_path` everywhere:
+- both nodes and the launch file;
+- the fake robots and the tests;
+- `joint_torque_demo.py` and `zero_torque_joint_check.py`.
+
+No command needs `urdf_path:=` unless you want another model. Do not use the model the robot
+reports (`urdf_type`, which is `G2_t2_crsB` under `/home/agi/app/share/genie_robot_description`).
+An empty parameter (`urdf_path: ""` in the YAML, or `-p urdf_path:=""` on the node itself) still
+selects it, and the node then warns. An empty launch argument is ignored.
+
+The file was generated from the simulation model (its header says "NOT validated against the real
+robot"). Check the dry-run gravity table on the robot before the first real run.
+
 ## Run on the robot's computer
 
 The robot's computer is a Jetson Thor running Ubuntu 24.04 (aarch64, Python 3.12). The GDK is
@@ -18,7 +34,7 @@ profile:
 | | Robot profile |
 |---|---|
 | Image | ROS 2 **Jazzy**, arm64 (`g2-torque-subscriber:jazzy`, built on first use, needs internet). The robot's GDK needs glibc 2.38 and `GLIBCXX_3.4.32`, so Humble (Ubuntu 22.04) cannot load it. |
-| GDK | `/home/agi/app`, mounted read-only at the same path. The vendor's paths (URDF, `cosine_ipc.prototxt`) therefore work unchanged in the container. The entrypoint sets `COSINE_BUS_CONFIG_PATH` and `COSINE_BUS_ENABLE_TOPIC_CONFIG_MERGE=1`, as in the vendor's instructions. |
+| GDK | `/home/agi/app`, mounted read-only at the same path. The vendor's paths (`cosine_ipc.prototxt`, `conf/sys/run.conf`) therefore work unchanged in the container. The entrypoint sets `COSINE_BUS_CONFIG_PATH` and `COSINE_BUS_ENABLE_TOPIC_CONFIG_MERGE=1`, as in the vendor's instructions. |
 | State stream | UDP to `10.42.1.101:8852`, on the robot itself. |
 | User | The container always runs as root, like the vendor demo (`sudo su`), because the robot services' `/dev/shm` segments are root-only. `agi` is not in the `docker` group, so use `sudo docker/run.sh`. `docker/ws` ends up owned by root. |
 | Other mounts | `/data` read-only (the GDK reads `/data/version` and `/data/parameters`) and `/data/logs` writable (the GDK's `LOG_PATH`). |
@@ -46,17 +62,16 @@ ls /home/agi/app/gdk/build_dep/cpp/aarch64/include       # GDK headers: expect c
 sudo docker/run.sh colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 #   the CMake output must say "GDK: /home/agi/app (aarch64)"
 
-U=/home/agi/app/share/genie_robot_description/urdf/G2_t2_crsB/G2_t2_crsB.urdf
-
 # Read-only checks. Neither one switches the control mode or sends torque.
 sudo docker/run.sh bash -c 'echo $LOCATOR_IP $AORTA_DISCOVERY_URI $COSINE_BUS_CONFIG_PATH'
 #   expect: 10.42.1.101 http://10.42.1.101:2379 /home/agi/app/conf/dds/cosine_ipc.prototxt
-sudo docker/run.sh bash src/g2_torque_subscriber/test/coload_check.sh $U    # GDK next to ROS 2
-sudo docker/run.sh ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true urdf_path:=$U
-#   with the arms at rest, the gravity table's diff column must be small
+sudo docker/run.sh bash src/g2_torque_subscriber/test/coload_check.sh    # GDK next to ROS 2
+sudo docker/run.sh ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true
+#   the log must say "dynamics model: .../urdf/genie_g2_crs_omnipicker.urdf", and with the arms
+#   at rest the gravity table's diff column must be small
 
 # Real run: the arms move. Clear the area and keep the e-stop in reach.
-sudo docker/run.sh ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=$U \
+sudo docker/run.sh ros2 launch g2_torque_subscriber torque_subscriber.launch.py \
   compensate_gravity:=true
 # Second ssh session: commands, as in Quick start
 sudo docker/run.sh ros2 topic pub -r 500 --qos-reliability best_effort \
@@ -88,7 +103,7 @@ sudo ufw status                                     # if active: sudo ufw allow 
 
 # 2. GDK, read-only (inside docker/run.sh)
 echo $LOCATOR_IP $AORTA_DISCOVERY_URI               # expect: 10.42.1.102 http://10.42.1.101:2379
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true urdf_path:=/models/<g2>.urdf
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true
 ros2 topic hz /g2_torque_subscriber/left/joint_states   # second shell: ~100 Hz
 
 # 3. Torque-mode stream, UDP 8852 (watch during the first real run)
@@ -109,25 +124,25 @@ sudo tcpdump -ni <wired interface> udp port 8852 -c 20
 ```bash
 cd agibot_g2_torque_control_ros2_node
 docker/run.sh colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
-MODELS_DIR=~/agibot_g2_torque_control/models/urdf docker/run.sh
+docker/run.sh
 
 # inside the container. Add dry_run:=true to any step first: it computes and publishes, but never
-# switches mode or sends torque. Add impl:=py for the Python node.
-U=/models/<g2>.urdf
+# switches mode or sends torque. Add impl:=py for the Python node. The URDF defaults to the
+# package's genie_g2_crs_omnipicker.urdf.
 
 # 0. No compensation (default): your commands carry the full torque, gravity included
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=$U
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py
 
 # 1. + gravity g(q)
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=$U \
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py \
   compensate_gravity:=true
 
 # 2. + Coriolis / centrifugal C(q, dq) dq
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=$U \
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py \
   compensate_gravity:=true compensate_coriolis:=true
 
 # 3. + inertia feed-forward M(q) ddq_d
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=$U \
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py \
   compensate_gravity:=true compensate_coriolis:=true compensate_inertia:=true
 
 # second shell (docker/run.sh), steps 1-3: command the left arm (Nm, on top of the enabled terms)
@@ -265,11 +280,12 @@ After pulling changes to `docker/`, rebuild the image with `docker rmi g2-torque
 
 ```bash
 # Build the image (ros:humble-ros-base + pinocchio + cyclonedds) and the workspace.
-# GDK_APP_DIR defaults to ./agibot_gdk/app; MODELS_DIR is mounted at /models for URDFs.
+# GDK_APP_DIR defaults to ./agibot_gdk/app. MODELS_DIR (optional) is mounted at /models, for
+# other URDFs than the package's default genie_g2_crs_omnipicker.urdf.
 docker/run.sh colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 
 # Shell in the container (ROS, GDK env.sh and the workspace are already sourced)
-MODELS_DIR=~/agibot_g2_torque_control/models/urdf docker/run.sh
+docker/run.sh
 ```
 
 To build outside this container, use any Humble environment with `ros-humble-pinocchio`, pass
@@ -286,7 +302,7 @@ switches mode or sends torque. Check the pre-flight table: `diff` should be smal
 rest.
 
 ```bash
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true urdf_path:=/models/<g2>.urdf
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true
 ```
 
 Then run for real (C++, recommended for 1 kHz), or the Python version. With no `compensate_*`
@@ -294,8 +310,8 @@ flags the node adds nothing and waits for full-torque commands on both arms. See
 enabling the terms one at a time.
 
 ```bash
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=/models/<g2>.urdf
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py impl:=py urdf_path:=/models/<g2>.urdf
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py impl:=py
 ```
 
 Send a command. With `compensate_gravity:=true` it is Nm on top of the model terms, and if you stop
@@ -316,18 +332,19 @@ is best effort. If it struggles, raise `publish_decimation`.
 
 The fakes simulate both arms (Pinocchio forward dynamics on the URDF) and emulate the mode-9
 rules: no gravity compensation, the 50 Nm step e-stop, rejected frames, and joint-limit stops.
+Both use the package's `genie_g2_crs_omnipicker.urdf`:
+- the C++ fake takes it from the node's `urdf_path`;
+- the Python fake takes it from `G2_FAKE_URDF`, which defaults to the same file.
 
 ```bash
-export G2_FAKE_URDF=/models/<g2>.urdf
 # C++
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py backend:=fake urdf_path:=$G2_FAKE_URDF \
-  compensate_gravity:=true
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py backend:=fake compensate_gravity:=true
 # Python: put the fake agibot_gdk first on PYTHONPATH AND pass backend:=fake. The Python node
 # refuses to connect when the imported agibot_gdk is not the one backend names, so a mistyped
 # PYTHONPATH can never turn a rehearsal into a run on the real robot.
 PYTHONPATH=$(ros2 pkg prefix g2_torque_subscriber)/share/g2_torque_subscriber/fake_gdk:$PYTHONPATH \
   ros2 launch g2_torque_subscriber torque_subscriber.launch.py impl:=py backend:=fake \
-  urdf_path:=$G2_FAKE_URDF compensate_gravity:=true
+  compensate_gravity:=true
 ```
 
 ## Tests (no robot needed, run inside the container)
@@ -343,11 +360,12 @@ PYTHONPATH=$(ros2 pkg prefix g2_torque_subscriber)/share/g2_torque_subscriber/fa
 #    the fake agibot_gdk.
 # The fake plant uses the same URDF as the node, so this tests the plumbing, not whether the URDF
 # matches the robot. That is what the on-robot dry-run table is for.
-python3 src/g2_torque_subscriber/test/smoke_test_fake.py --impl cpp --urdf /models/<g2>.urdf
-python3 src/g2_torque_subscriber/test/smoke_test_fake.py --impl py  --urdf /models/<g2>.urdf
+# --urdf defaults to the package's genie_g2_crs_omnipicker.urdf.
+python3 src/g2_torque_subscriber/test/smoke_test_fake.py --impl cpp
+python3 src/g2_torque_subscriber/test/smoke_test_fake.py --impl py
 # Real GDK next to ROS 2 (rmw_fastrtps and rmw_cyclonedds, C++ and Python): no crash, ROS
 # interface alive, clean exit on Ctrl+C while the GDK waits for a robot
-bash src/g2_torque_subscriber/test/coload_check.sh /models/<g2>.urdf
+bash src/g2_torque_subscriber/test/coload_check.sh
 ```
 
 ## Layout
@@ -361,6 +379,7 @@ g2_torque_subscriber/
   g2_torque_subscriber/torque_subscriber_node.py   Python node (same interface)
   test/fake_gdk/agibot_gdk/            fake GDK Python module
   config/torque_subscriber.yaml        parameters (shared by both nodes)
+  urdf/genie_g2_crs_omnipicker.urdf   the confirmed G2 model (default urdf_path everywhere)
   launch/torque_subscriber.launch.py   impl:=cpp|py, dry_run, backend, urdf_path, compensate_*
 docker/                                image (Humble on the PC, Jazzy on the robot), entrypoint, run.sh
 joint_torque_demo.py                   vendor example the torque handling follows

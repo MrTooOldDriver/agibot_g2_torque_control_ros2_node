@@ -40,7 +40,8 @@ auto-detected):
 Both nodes must build and run on Humble and Jazzy. Jazzy ships Pinocchio 4.x.
 
 In both profiles:
-- The package is mounted at `/ws/src/g2_torque_subscriber` and `MODELS_DIR` at `/models`.
+- The package is mounted at `/ws/src/g2_torque_subscriber`. `MODELS_DIR` (optional, other URDFs)
+  is mounted at `/models`.
 - The entrypoint sources `/opt/ros/$ROS_DISTRO`, then the GDK `env.sh` from `$G2_GDK_MOUNT`, then
   `/ws/install/setup.bash`. It also sets `COSINE_BUS_CONFIG_PATH` and
   `COSINE_BUS_ENABLE_TOPIC_CONFIG_MERGE=1`, because the robot's `env.sh` does not.
@@ -57,16 +58,16 @@ includes rsync, docker, sudo and launching the node. The on-robot steps are in t
 
 ```bash
 docker/run.sh colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
-MODELS_DIR=~/agibot_g2_torque_control/models/urdf docker/run.sh     # shell
+docker/run.sh     # shell
 
 # inside the container
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py backend:=fake urdf_path:=/models/<g2>.urdf compensate_gravity:=true
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true urdf_path:=/models/<g2>.urdf   # on the robot, sends nothing
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py backend:=fake compensate_gravity:=true
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true   # on the robot, sends nothing
 
 # tests (no robot), from /ws (the container WORKDIR). The smoke test is the main regression test: run it for both impls.
-python3 src/g2_torque_subscriber/test/smoke_test_fake.py --impl cpp --urdf /models/<g2>.urdf
-python3 src/g2_torque_subscriber/test/smoke_test_fake.py --impl py  --urdf /models/<g2>.urdf
-bash src/g2_torque_subscriber/test/coload_check.sh /models/<g2>.urdf   # needs the real GDK mounted
+python3 src/g2_torque_subscriber/test/smoke_test_fake.py --impl cpp
+python3 src/g2_torque_subscriber/test/smoke_test_fake.py --impl py
+bash src/g2_torque_subscriber/test/coload_check.sh   # needs the real GDK mounted
 ```
 
 There are no unit tests or linters. `smoke_test_fake.py` runs four scenarios (A: all terms on,
@@ -98,6 +99,20 @@ from `wait_control_mode`). `CMakeLists.txt` installs it with `install(DIRECTORY 
 (`/agibot_gdk/`) so that it does not hide this directory. It imports numpy and pinocchio inside
 `Robot()`, because the node imports `agibot_gdk` under `RTLD_DEEPBIND`.
 
+**Robot model (URDF).** The confirmed model is `urdf/genie_g2_crs_omnipicker.urdf` in the
+package, installed to `share/g2_torque_subscriber/urdf/`. It was generated from the simulation
+model `genie_sim_robot_model` with arm crs and the omnipicker grippers, which add 16 gripper
+joints. It is the default URDF everywhere, so commands need no `urdf_path:=`:
+- both nodes' `urdf_path` (via `ament_index`);
+- the C++ fake (through `urdf_path`) and the Python fake (`G2_FAKE_URDF`);
+- `smoke_test_fake.py --urdf` and `coload_check.sh`;
+- the two top-level scripts (relative to the script).
+
+The robot's reported `urdf_type` (`G2_t2_crsB`) is **not** the right model. It is used only when
+`urdf_path` is explicitly `""`, and the node then warns. An empty launch argument does not count.
+Do not reintroduce a different default. The URDF must live inside the package, because the
+container only mounts the package directory.
+
 ## Architecture
 
 **GDK isolation via dlopen.** This is the most important constraint. The GDK bundles Fast DDS 3,
@@ -114,7 +129,9 @@ flags. CMake builds `g2_gdk_backend` only if it finds the GDK (`-DGDK_APP_DIR` o
 **Backends.** `gdk_backend.cpp` wraps the real GDK. `fake_backend.cpp` simulates both arms with
 Pinocchio forward dynamics on the same URDF, and emulates the mode-9 rules: no gravity
 compensation, a 50 Nm per-frame step e-stop, rejected frames and joint-limit stops. It is
-configured by the env vars `G2_FAKE_URDF`, `G2_FAKE_INITIAL_POSE` and `G2_FAKE_FRICTION`.
+built from the node's `urdf_path` and configured by the env vars `G2_FAKE_INITIAL_POSE` and
+`G2_FAKE_FRICTION`. The fake Python GDK reads its URDF from `G2_FAKE_URDF`, which defaults to
+the packaged model.
 `RunTorqueLoop` owns the 1 kHz read, callback, write cycle. It never changes the control mode
 itself.
 

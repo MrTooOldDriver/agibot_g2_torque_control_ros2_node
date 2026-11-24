@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """End-to-end smoke test of the torque subscriber against the simulated arms (no robot needed).
 
-  python3 smoke_test_fake.py --impl cpp --urdf /models/<g2>.urdf
-  python3 smoke_test_fake.py --impl py  --urdf /models/<g2>.urdf
+  python3 smoke_test_fake.py --impl cpp
+  python3 smoke_test_fake.py --impl py
+--urdf defaults to the package's confirmed G2 model, urdf/genie_g2_crs_omnipicker.urdf.
 
 Starts the node (backend:=fake; for --impl py also the fake agibot_gdk first on PYTHONPATH) in a
 private namespace /g2_smoke_<pid>_<time>, so that the test commands (up to 15 Nm) can never reach
@@ -267,7 +268,8 @@ def run_d(probe, a):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--impl", choices=["cpp", "py"], default="cpp")
-    ap.add_argument("--urdf", required=True)
+    ap.add_argument("--urdf", default=os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "urdf", "genie_g2_crs_omnipicker.urdf"))
     a = ap.parse_args()
     rclpy.init()
     probe = Probe()

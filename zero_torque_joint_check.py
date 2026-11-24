@@ -45,9 +45,11 @@ check on states read at 100 Hz, for arms moved by other means (e.g. wrist-button
 Python 1 kHz is best effort. Keep the e-stop at hand. Run in a terminal (Enter/q need a tty) with
 the GDK environment sourced, e.g. from the repo root in this repo's container:
   docker run --rm -it --network host -v "$PWD":/repo:ro -v "$PWD/agibot_gdk/app":/opt/agibot/app:ro \
-    -v <urdf dir>:/models:ro g2-torque-subscriber:humble \
-    python3 /repo/zero_torque_joint_check.py /models/<g2>.urdf [--dry-run] [--joints L4,R4]
-Without urdf_path the URDF of the robot model reported by the robot is used (on the robot's
+    g2-torque-subscriber:humble \
+    python3 /repo/zero_torque_joint_check.py [urdf_path] [--dry-run] [--joints L4,R4]
+Without urdf_path the confirmed G2 model of this repo is used,
+g2_torque_subscriber/urdf/genie_g2_crs_omnipicker.urdf. An empty urdf_path ("") uses the URDF of
+the robot model reported by the robot (G2_t2_crsB, NOT the right model; on the robot's
 filesystem, not in the container).
 Exit code: 0 every checked joint passed, 1 setup error, 2 GDK error, 3 safety abort, 4 a joint
 failed.
@@ -66,6 +68,9 @@ import numpy as np
 import pinocchio as pin
 
 URDF_DIR = "/home/agi/app/share/genie_robot_description/urdf"
+# The G2 model confirmed for this robot (the robot's reported urdf_type is not the right one).
+DEFAULT_URDF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "g2_torque_subscriber",
+                            "urdf", "genie_g2_crs_omnipicker.urdf")
 ARMS = [
     "idx21_arm_l_joint1", "idx22_arm_l_joint2", "idx23_arm_l_joint3", "idx24_arm_l_joint4",
     "idx25_arm_l_joint5", "idx26_arm_l_joint6", "idx27_arm_l_joint7",
@@ -418,8 +423,9 @@ def run(robot, args):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("urdf", nargs="?", default="",
-                   help="URDF of the robot (default: the robot's reported urdf_type)")
+    p.add_argument("urdf", nargs="?", default=DEFAULT_URDF,
+                   help="URDF of the robot (default: the confirmed genie_g2_crs_omnipicker.urdf; "
+                        "\"\" = the robot's reported urdf_type, not the right model)")
     p.add_argument("--dry-run", action="store_true",
                    help="never switch the mode or send torque")
     p.add_argument("--joints", default=",".join(LABELS),

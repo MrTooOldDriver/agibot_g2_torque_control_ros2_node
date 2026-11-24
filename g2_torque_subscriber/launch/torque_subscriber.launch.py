@@ -1,12 +1,14 @@
 """Launch the G2 torque subscriber (C++ or Python implementation).
 
-  ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=/path/g2.urdf
-  ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=... compensate_gravity:=true
-  ros2 launch g2_torque_subscriber torque_subscriber.launch.py impl:=py urdf_path:=...
-  ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true urdf_path:=...
+  ros2 launch g2_torque_subscriber torque_subscriber.launch.py
+  ros2 launch g2_torque_subscriber torque_subscriber.launch.py compensate_gravity:=true
+  ros2 launch g2_torque_subscriber torque_subscriber.launch.py impl:=py
+  ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true
 
 Arguments override the parameter file (config/torque_subscriber.yaml by default); an empty
-argument keeps the file's value.
+argument keeps the file's value. The dynamics model defaults to the confirmed G2 URDF installed
+with the package (share/g2_torque_subscriber/urdf/genie_g2_crs_omnipicker.urdf); pass
+urdf_path:=... only to use another model.
 """
 
 import os
@@ -59,7 +61,8 @@ def generate_launch_description():
         DeclareLaunchArgument("namespace", default_value=""),
         DeclareLaunchArgument("params_file", default_value=default_params),
         DeclareLaunchArgument("urdf_path", default_value="",
-                              description="URDF of the dynamics model (overrides params_file)"),
+                              description="URDF of the dynamics model (default: the package's "
+                                          "urdf/genie_g2_crs_omnipicker.urdf)"),
         DeclareLaunchArgument("backend", default_value="",
                               description="gdk | fake (C++ also: <module path>). Python: "
                                           "must match the agibot_gdk on PYTHONPATH"),

@@ -26,6 +26,12 @@ Export required dependencies:
 export COSINE_BUS_CONFIG_PATH=/home/agi/app/conf/dds/cosine_ipc.prototxt
 export COSINE_BUS_ENABLE_TOPIC_CONFIG_MERGE=1
 
-Run script:
+Run script with the confirmed URDF, genie_g2_crs_omnipicker.urdf. It ships with this repo in
+g2_torque_subscriber/urdf/ and reaches the robot with the repo copy (README, "Run on the robot's
+computer"):
 
-python3 joint_torque.py /home/agi/app/share/genie_robot_description/urdf/G2_t2_crsB/G2_t2_crsB.urdf
+python3 joint_torque.py /home/agi/g2_torque/g2_torque_subscriber/urdf/genie_g2_crs_omnipicker.urdf
+
+The vendor's original command used
+/home/agi/app/share/genie_robot_description/urdf/G2_t2_crsB/G2_t2_crsB.urdf, which is NOT the
+right model for this robot.

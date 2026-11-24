@@ -72,7 +72,7 @@ install(TARGETS g2_fake_backend LIBRARY DESTINATION lib/${PROJECT_NAME}
 ament_python_install_package(${PROJECT_NAME})
 install(PROGRAMS scripts/torque_subscriber_node.py DESTINATION lib/${PROJECT_NAME})
 
-install(DIRECTORY launch config DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY launch config urdf DESTINATION share/${PROJECT_NAME})  # urdf/: the confirmed G2 model
 install(DIRECTORY test/fake_gdk DESTINATION share/${PROJECT_NAME})
 
 ament_package()

@@ -7,9 +7,13 @@
     # refuses to connect unless it is the one named here (fake: share/<pkg>/fake_gdk).
     backend: "gdk"
 
-    # Dynamics model. Empty urdf_path: use <urdf_dir>/<urdf_type>/<urdf_type>.urdf with the
-    # urdf_type the robot reports (urdf_dir below is the path on the robot itself).
-    urdf_path: ""
+    # Dynamics model. urdf_path is deliberately NOT set here. Both nodes then load the model
+    # confirmed for this robot, genie_g2_crs_omnipicker.urdf, which is installed with the package
+    # (share/g2_torque_subscriber/urdf/).
+    # Set urdf_path (or pass urdf_path:=...) only to use another model. urdf_path: "" here (an
+    # empty launch argument does not count) makes the node load
+    # <urdf_dir>/<urdf_type>/<urdf_type>.urdf with the urdf_type the robot reports. On this robot
+    # that is G2_t2_crsB, which is NOT the right model; the node warns.
     urdf_dir: "/home/agi/app/share/genie_robot_description/urdf"
 
     # Compensation terms added by the node (the terms of joint_torque_demo.py's rnea(q, dq, ddq_d)).

@@ -24,9 +24,12 @@ Python 1 kHz is best-effort; use the C++ sample for hard real-time.
 
 Run from this directory (the robot moves, keep the area around it clear):
   python3 joint_impedance_move_callback_example.py [urdf_path]
-Without urdf_path the URDF of the robot model reported by the robot is used.
+Without urdf_path the confirmed G2 model of this repo is used,
+g2_torque_subscriber/urdf/genie_g2_crs_omnipicker.urdf. An empty urdf_path ("") uses the URDF
+of the robot model reported by the robot (G2_t2_crsB, NOT the right model).
 """
 
+import os
 import signal
 import sys
 
@@ -36,6 +39,9 @@ import pinocchio as pin
 
 DT = 0.001
 URDF_DIR = "/home/agi/app/share/genie_robot_description/urdf"
+# The G2 model confirmed for this robot (the robot's reported urdf_type is not the right one).
+DEFAULT_URDF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "g2_torque_subscriber",
+                            "urdf", "genie_g2_crs_omnipicker.urdf")
 ARMS = [
     "idx21_arm_l_joint1", "idx22_arm_l_joint2", "idx23_arm_l_joint3", "idx24_arm_l_joint4",
     "idx25_arm_l_joint5", "idx26_arm_l_joint6", "idx27_arm_l_joint7",
@@ -247,7 +253,7 @@ def main():
     signal.signal(signal.SIGTERM, on_signal)
     gdk.gdk_init()
     try:
-        return run(gdk.Robot(), sys.argv[1] if len(sys.argv) > 1 else "")
+        return run(gdk.Robot(), sys.argv[1] if len(sys.argv) > 1 else DEFAULT_URDF)
     finally:
         gdk.gdk_release()
 

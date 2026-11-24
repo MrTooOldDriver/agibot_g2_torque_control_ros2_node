@@ -4,9 +4,10 @@
 # The node runs with dry_run:=true, so it never switches the control mode or sends torque, and the
 # check is also safe on the robot's own computer, where the GDK really connects. Run it inside the
 # container (docker/run.sh: GDK mounted and sourced, workspace sourced):
-#   bash src/g2_torque_subscriber/test/coload_check.sh /models/<g2>.urdf
+#   bash src/g2_torque_subscriber/test/coload_check.sh [urdf]
+# The URDF defaults to the package's confirmed G2 model, urdf/genie_g2_crs_omnipicker.urdf.
 set -u
-URDF=${1:?usage: coload_check.sh <urdf>}
+URDF=${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../urdf" && pwd)/genie_g2_crs_omnipicker.urdf}
 PREFIX=$(ros2 pkg prefix g2_torque_subscriber)
 fail=0
 for rmw in rmw_fastrtps_cpp rmw_cyclonedds_cpp; do

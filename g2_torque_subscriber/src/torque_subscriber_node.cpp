@@ -51,6 +51,7 @@
 #include <vector>
 
 #include <ament_index_cpp/get_package_prefix.hpp>
+#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
@@ -67,11 +68,25 @@ using Float64MultiArray = std_msgs::msg::Float64MultiArray;
 constexpr std::array<const char*, 2> kArmLabels = {"left", "right"};
 constexpr int kModeSwitchTimeoutMs = 500;  // WaitControlMode when entering and leaving mode 9
 
+// The G2 model confirmed for this robot, installed with the package (urdf/). It is the default of
+// urdf_path. The robot's reported urdf_type (G2_t2_crsB) is NOT the right model.
+constexpr const char* kDefaultUrdfName = "genie_g2_crs_omnipicker.urdf";
+
+std::string DefaultUrdfPath() {
+  try {
+    return ament_index_cpp::get_package_share_directory("g2_torque_subscriber") + "/urdf/" +
+           kDefaultUrdfName;
+  } catch (const std::exception&) {
+    return kDefaultUrdfName;  // package not found: loading fails loudly, no silent fallback
+  }
+}
+
 enum Phase : int { kIdle, kConnecting, kPreparing, kStreaming, kRestoring, kDone };
 
 struct Params {
   std::string backend;                   // "gdk", "fake" or a path to a backend module
-  std::string urdf_path;                 // URDF of the dynamics model ("" = ask the robot)
+  std::string urdf_path;                 // URDF of the dynamics model (default: kDefaultUrdfName,
+                                         // "" = the robot's urdf_type, not the confirmed model)
   std::string urdf_dir;                  // where <urdf_type>/<urdf_type>.urdf lives
   bool compensate_gravity{false};        // + g(q)
   bool compensate_coriolis{false};       // + C(q, dq) dq
@@ -208,7 +223,7 @@ class TorqueSubscriberNode : public rclcpp::Node {
   // --------------------------------------------------------------------------------------------
   void DeclareParameters() {
     p_.backend = declare_parameter<std::string>("backend", "gdk");
-    p_.urdf_path = declare_parameter<std::string>("urdf_path", "");
+    p_.urdf_path = declare_parameter<std::string>("urdf_path", DefaultUrdfPath());
     p_.urdf_dir = declare_parameter<std::string>(
         "urdf_dir", "/home/agi/app/share/genie_robot_description/urdf");
     p_.compensate_gravity = declare_parameter<bool>("compensate_gravity", false);
@@ -366,6 +381,9 @@ class TorqueSubscriberNode : public rclcpp::Node {
         return 1;
       }
       urdf = p_.urdf_dir + "/" + type + "/" + type + ".urdf";
+      RCLCPP_WARN(get_logger(),
+                  "urdf_path is empty: using the robot's urdf_type '%s', not the confirmed model "
+                  "%s (unset urdf_path to use it)", type.c_str(), kDefaultUrdfName);
     }
     try {
       model_ = std::make_unique<DynamicsModel>(urdf);

@@ -56,6 +56,18 @@ ARM_DOF = len(ARM_JOINT_NAMES)
 ARM_LABELS = ("left", "right")
 MODE_JOINT_TORQUE = 9
 MODE_SWITCH_TIMEOUT_MS = 500  # wait_control_mode when entering and leaving mode 9
+# The G2 model confirmed for this robot, installed with the package (urdf/). It is the default of
+# urdf_path. The robot's reported urdf_type (G2_t2_crsB) is NOT the right model.
+DEFAULT_URDF_NAME = "genie_g2_crs_omnipicker.urdf"
+
+
+def default_urdf_path():
+    from ament_index_python.packages import get_package_share_directory  # noqa: PLC0415
+    try:
+        return os.path.join(get_package_share_directory("g2_torque_subscriber"), "urdf",
+                            DEFAULT_URDF_NAME)
+    except Exception:  # noqa: BLE001  package not found: loading fails loudly, no silent fallback
+        return DEFAULT_URDF_NAME
 
 
 def arm_slice(arm):
@@ -261,7 +273,7 @@ class TorqueSubscriberNode(Node):
     def _declare_parameters(self):
         d = self.declare_parameter
         p = {
-            "urdf_path": d("urdf_path", "").value,
+            "urdf_path": d("urdf_path", default_urdf_path()).value,
             "urdf_dir": d("urdf_dir", "/home/agi/app/share/genie_robot_description/urdf").value,
             "compensate_gravity": bool(d("compensate_gravity", False).value),
             "compensate_coriolis": bool(d("compensate_coriolis", False).value),
@@ -439,6 +451,8 @@ class TorqueSubscriberNode(Node):
                 log.fatal("robot did not report its urdf_type; set parameter urdf_path")
                 return 1
             urdf = f"{self.p['urdf_dir']}/{urdf_type}/{urdf_type}.urdf"
+            log.warn(f"urdf_path is empty: using the robot's urdf_type '{urdf_type}', not the "
+                     f"confirmed model {DEFAULT_URDF_NAME} (unset urdf_path to use it)")
         try:
             self.model = DynamicsModel(urdf)
         except Exception as e:  # noqa: BLE001

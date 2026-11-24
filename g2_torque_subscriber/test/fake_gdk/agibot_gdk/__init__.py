@@ -13,7 +13,7 @@ Emulated robot behaviour (direct torque mode 9, see the GDK direct torque docs):
   - a frame without exactly the 14 arm joints or with a non-finite torque is rejected with
     ValueError (kInvalidInput), as by the real binding;
   - URDF joint limits act as hard stops.
-Environment: G2_FAKE_URDF (required), G2_FAKE_FRICTION (viscous friction, Nm*s/rad, default 0.5),
+Environment: G2_FAKE_URDF (default: the package's urdf/genie_g2_crs_omnipicker.urdf), G2_FAKE_FRICTION (viscous friction, Nm*s/rad, default 0.5),
              G2_FAKE_INITIAL_POSE (14 comma-separated rad, default all 0 clamped to limits).
 
 Use: put the directory holding this package first on PYTHONPATH and run the node with
@@ -72,9 +72,10 @@ class Robot:
 
         self._np, self._pin = np, pin
         urdf = os.environ.get("G2_FAKE_URDF", "")
-        if not urdf:
-            raise RuntimeError("fake agibot_gdk: set G2_FAKE_URDF (the simulated arms are built "
-                               "from it)")
+        if not urdf:  # default: the confirmed G2 model installed with the package
+            from ament_index_python.packages import get_package_share_directory  # noqa: PLC0415
+            urdf = os.path.join(get_package_share_directory("g2_torque_subscriber"), "urdf",
+                                "genie_g2_crs_omnipicker.urdf")
         full = pin.buildModelFromUrdf(urdf)
         lock = [j for j in range(1, full.njoints) if full.names[j] not in ARMS]
         self._others = [full.names[j] for j in lock
