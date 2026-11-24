@@ -6,30 +6,43 @@
     # The Python node uses whichever agibot_gdk is on PYTHONPATH.
     backend: "gdk"
 
-    # Gravity compensation model. Empty urdf_path: use <urdf_dir>/<urdf_type>/<urdf_type>.urdf
-    # with the urdf_type the robot reports (urdf_dir below is the path on the robot itself).
+    # Dynamics model. Empty urdf_path: use <urdf_dir>/<urdf_type>/<urdf_type>.urdf with the
+    # urdf_type the robot reports (urdf_dir below is the path on the robot itself).
     urdf_path: ""
     urdf_dir: "/home/agi/app/share/genie_robot_description/urdf"
 
-    # Commands: std_msgs/Float64MultiArray, 7 values (joint1..7, Nm), added on top of gravity
-    # compensation. QoS KeepLast(1) / BestEffort / Volatile, as in the Franka torque subscriber.
-    left_torque_topic: "~/left/external_torques"
+    # Compensation terms added by the node (the terms of joint_torque_demo.py's rnea(q, dq, ddq_d)).
+    # All off: the commands must carry the FULL torque, gravity included; the node then enters
+    # mode 9 only once both arms are commanded close to the holding torque, and a missing command
+    # ends the torque loop (zero torque would drop the arms).
+    compensate_gravity: false     # + g(q)
+    compensate_coriolis: false    # + C(q, dq) dq, measured velocities (waist/head included)
+    compensate_inertia: false     # + M(q) ddq_d, ddq_d from the desired-acceleration topics
+
+    # Inputs: std_msgs/Float64MultiArray, 7 values (joint1..7). QoS KeepLast(1) / BestEffort /
+    # Volatile, as in the Franka torque subscriber.
+    left_torque_topic: "~/left/external_torques"               # Nm
     right_torque_topic: "~/right/external_torques"
-    command_timeout: 0.1          # s; after that the arm's external torque is 0 (gravity comp stays)
+    left_acceleration_topic: "~/left/desired_accelerations"    # rad/s^2, used by compensate_inertia
+    right_acceleration_topic: "~/right/desired_accelerations"
+    command_timeout: 0.1          # s; older inputs count as 0 (see compensate_gravity for commands)
 
     # State output (sensor_msgs/JointState). Empty topic name = not published.
-    joint_states_topic: "joint_states"                 # all joints the robot reports
-    left_joint_states_topic: "~/left/joint_states"     # 7 joints, measured q / dq / effort
+    joint_states_topic: "joint_states"                     # all joints the robot reports
+    left_joint_states_topic: "~/left/joint_states"         # 7 joints, measured q / dq / effort
     right_joint_states_topic: "~/right/joint_states"
-    commanded_torques_topic: "~/commanded_torques"     # 14 joints, effort = total torque sent
+    commanded_torques_topic: "~/commanded_torques"         # 14 joints, effort = total torque sent
+    compensation_torques_topic: "~/compensation_torques"   # 14 joints, effort = enabled model terms
     publish_decimation: 1         # publish every n-th frame (1 = 1 kHz)
 
     # Safety
     max_torque_step: 15.0         # Nm per frame per joint (robot e-stops at > 50)
     effort_limit_scale: 1.0       # clamp total torque to this fraction of the URDF effort limit
-    joint_damping: 0.0            # Nm*s/rad, added as -joint_damping * dq (0 = Franka-like)
+    joint_damping: 0.0            # Nm*s/rad, added as -joint_damping * dq
     velocity_limit: 2.0           # rad/s; any arm joint faster -> end stream, restore mode (0 = off)
-    gravity_check_tolerance: 10.0 # Nm; refuse to start if |g(q) - measured effort| exceeds it (0 = off)
+    # Nm. Gravity compensation on: refuse to start if |g(q) - measured effort| exceeds it.
+    # Off: enter mode 9 only once the first commanded torque is this close to the measured effort.
+    gravity_check_tolerance: 10.0 # 0 = off
 
     # Loop
     dry_run: false                # read + compute + publish, never switch mode or send torque

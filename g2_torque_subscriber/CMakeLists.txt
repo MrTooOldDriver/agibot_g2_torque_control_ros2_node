@@ -17,15 +17,15 @@ find_package(std_msgs REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(Threads REQUIRED)
 
-# ---- Gravity model (Pinocchio), shared by the node and the fake backend ----
-add_library(g2_gravity_model STATIC src/gravity_model.cpp)
-set_target_properties(g2_gravity_model PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(g2_gravity_model PUBLIC include)
-target_link_libraries(g2_gravity_model PUBLIC pinocchio::pinocchio)
+# ---- Dynamics model (Pinocchio: gravity, Coriolis, inertia), used by the node ----
+add_library(g2_dynamics_model STATIC src/dynamics_model.cpp)
+set_target_properties(g2_dynamics_model PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(g2_dynamics_model PUBLIC include)
+target_link_libraries(g2_dynamics_model PUBLIC pinocchio::pinocchio)
 
 # ---- The node. It does NOT link the GDK: the GDK is dlopen()ed from a backend module ----
 add_executable(torque_subscriber_node src/torque_subscriber_node.cpp)
-target_link_libraries(torque_subscriber_node g2_gravity_model ${CMAKE_DL_LIBS} Threads::Threads)
+target_link_libraries(torque_subscriber_node g2_dynamics_model ${CMAKE_DL_LIBS} Threads::Threads)
 ament_target_dependencies(torque_subscriber_node ament_index_cpp rclcpp sensor_msgs std_msgs)
 
 # ---- Fake backend: simulated arms for offline tests (backend:=fake) ----

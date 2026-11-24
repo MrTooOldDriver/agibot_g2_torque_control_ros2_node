@@ -37,14 +37,33 @@ cd agibot_g2_torque_control_ros2_node
 docker/run.sh colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 MODELS_DIR=~/agibot_g2_torque_control/models/urdf docker/run.sh
 
-# inside the container
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true urdf_path:=/models/<g2>.urdf
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=/models/<g2>.urdf
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py impl:=py urdf_path:=/models/<g2>.urdf
+# inside the container. Add dry_run:=true to any step first: it computes and publishes, but never
+# switches mode or sends torque. Add impl:=py for the Python node.
+U=/models/<g2>.urdf
 
-# from a second shell (docker/run.sh): send a command to the left arm
+# 0. No compensation (default): your commands carry the full torque, gravity included
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=$U
+
+# 1. + gravity g(q)
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=$U \
+  compensate_gravity:=true
+
+# 2. + Coriolis / centrifugal C(q, dq) dq
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=$U \
+  compensate_gravity:=true compensate_coriolis:=true
+
+# 3. + inertia feed-forward M(q) ddq_d
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=$U \
+  compensate_gravity:=true compensate_coriolis:=true compensate_inertia:=true
+
+# second shell (docker/run.sh), steps 1-3: command the left arm (Nm, on top of the enabled terms)
 ros2 topic pub -r 500 --qos-reliability best_effort /g2_torque_subscriber/left/external_torques \
   std_msgs/msg/Float64MultiArray "{data: [0, 0, 0, 2.0, 0, 0, 0]}"
+# step 3: desired accelerations of the left arm (rad/s^2)
+ros2 topic pub -r 500 --qos-reliability best_effort /g2_torque_subscriber/left/desired_accelerations \
+  std_msgs/msg/Float64MultiArray "{data: [0, 0, 0, 0.5, 0, 0, 0]}"
+# what the enabled terms add (Nm)
+ros2 topic echo /g2_torque_subscriber/compensation_torques --field effort
 ```
 
 Direct joint torque control of the **AGIBOT G2** arms from ROS 2 topics: the G2 counterpart of the
@@ -57,22 +76,33 @@ Both run in a ROS 2 Humble container.
 |---|---|---|
 | Command | `~/external_torques`, `Float64MultiArray`, 7 values | `~/left/external_torques` and `~/right/external_torques`, `Float64MultiArray`, 7 values each (joint1..7) |
 | QoS | KeepLast(1), BestEffort, Volatile | same |
-| Meaning | torque on top of the robot's gravity compensation | the same, but the **node** adds the gravity term g(q) (Pinocchio + URDF), because G2 mode 9 does none |
-| No message for 100 ms | zero torque, so the arm floats | that arm's external torque goes to 0 and **gravity compensation continues**, so the arm floats. Zero *total* torque would drop a G2 arm. |
+| Meaning | torque on top of the robot's gravity compensation | torque on top of the model terms the **node** adds (Pinocchio + URDF, the terms of `joint_torque_demo.py`). Each term has a flag and all are **off by default**, so by default a command is the full torque. G2 mode 9 compensates nothing. |
+| No message for 100 ms | zero torque, so the arm floats | `compensate_gravity` on: that arm's command goes to 0 and the model terms continue, so the arm floats. Off: the node ends the torque loop and restores the previous mode, because zero *total* torque would drop a G2 arm. |
 | Runs as | ros2_control controller | standalone node that owns the GDK connection (G2 has no ros2_control hardware interface) |
 | Joint states | joint_state_broadcaster | published by the node from the 1 kHz robot frames |
 
 ## Torque law (every 1 ms frame, 14 arm joints)
 
 ```
-tau = g(q) + tau_ext - joint_damping * dq                      g: Pinocchio gravity, waist/head at measured pose
+tau = [compensate_gravity]  g(q)                                  gravity
+    + [compensate_coriolis] C(q, dq) dq                           Coriolis + centrifugal
+    + [compensate_inertia]  M(q) ddq_d                            inertia feed-forward
+    + tau_ext - joint_damping * dq
 tau = clamp(tau, +- effort_limit_scale * URDF effort limit)
 tau = tau_prev + clamp(tau - tau_prev, +- max_torque_step)       tau_prev of frame 0 = measured effort (robot's holding torque)
 ```
 
-`tau_ext` is the most recent command of each arm, or 0 if that arm's command is older than
-`command_timeout`. The robot then shapes the torque further (about 2 Nm per frame slew, a 100 Hz
-low-pass filter, and a clamp at the limit). See the GDK docs, `agibot_gdk/app/gdk/site/contents/howto/direct_torque/`.
+The three terms are those of the vendor demo's `rnea(q, dq, ddq_d) = M ddq_d + C dq + g`:
+
+- **Waist and head:** these joints take their measured position, as in the demo. With
+  `compensate_coriolis`, their measured velocities also contribute, so waist motion feeds into the
+  arm torques.
+- **Desired acceleration:** `ddq_d` is the latest message on `~/<arm>/desired_accelerations`. The
+  demo plans its own path; the node has none, so your controller sends it.
+
+`tau_ext` and `ddq_d` are the most recent inputs of each arm, or 0 if older than `command_timeout`.
+The robot then shapes the torque further (about 2 Nm per frame slew, a 100 Hz low-pass filter, and
+a clamp at the limit). See the GDK docs, `agibot_gdk/app/gdk/site/contents/howto/direct_torque/`.
 
 ## ROS interface
 
@@ -81,9 +111,11 @@ Default node name `g2_torque_subscriber` (`~` = `/<namespace>/g2_torque_subscrib
 | Topic | Type | |
 |---|---|---|
 | `~/left/external_torques`, `~/right/external_torques` | `std_msgs/Float64MultiArray` (sub) | 7 values, Nm, joint1..7. Wrong length or NaN/Inf is rejected. |
+| `~/left/desired_accelerations`, `~/right/desired_accelerations` | `std_msgs/Float64MultiArray` (sub) | 7 values, rad/s², joint1..7. Used by `compensate_inertia`. |
 | `joint_states` | `sensor_msgs/JointState` (pub) | all joints the robot reports (arms, waist, head) |
 | `~/left/joint_states`, `~/right/joint_states` | `sensor_msgs/JointState` (pub) | the 7 joints of that arm: measured q, dq, effort |
-| `~/commanded_torques` | `sensor_msgs/JointState` (pub) | 14 arm joints, `effort` = total torque sent (gravity included) |
+| `~/commanded_torques` | `sensor_msgs/JointState` (pub) | 14 arm joints, `effort` = total torque sent |
+| `~/compensation_torques` | `sensor_msgs/JointState` (pub) | 14 arm joints, `effort` = sum of the enabled model terms |
 
 Arm joints: left `idx21_arm_l_joint1` … `idx27_arm_l_joint7`, right `idx61_arm_r_joint1` …
 `idx67_arm_r_joint7`. The publishers are reliable and publish every `publish_decimation`-th frame
@@ -93,15 +125,21 @@ Arm joints: left `idx21_arm_l_joint1` … `idx27_arm_l_joint7`, right `idx61_arm
 ## Lifecycle and safety
 
 1. Connect (GDK), load the URDF, and read one state frame.
-2. Pre-flight: the node checks that all 14 arm joints are present and that the model gravity g(q)
-   matches the measured effort within `gravity_check_tolerance` (10 Nm). If it does not, the node
-   refuses to start. A wrong URDF, an unregistered payload or a wrong waist pose would otherwise
-   cause drift or the 50 Nm step e-stop.
-3. Remember the control mode. The node refuses to start if the robot is already in mode 9. It then
-   switches to mode 9 and waits for confirmation. **Do not touch the arms while entering.**
-4. 1 kHz loop. Abort (final frame, then step 5) on: joint speed above `velocity_limit` (2 rad/s),
-   non-finite state or torque, or a GDK read timeout or error.
-5. **Restore the previous control mode** (the robot then holds the arms) and exit. Ctrl+C, SIGTERM,
+2. Pre-flight: the node checks that all 14 arm joints are present and prints model gravity g(q)
+   against the measured effort. With `compensate_gravity` on, it refuses to start if they differ by
+   more than `gravity_check_tolerance` (10 Nm). A wrong URDF, an unregistered payload or a wrong
+   waist pose would otherwise cause drift or the 50 Nm step e-stop.
+3. Remember the control mode. The node refuses to start if the robot is already in mode 9.
+4. **With `compensate_gravity` off only:** wait until both arms are commanded and the first torque
+   is within `gravity_check_tolerance` of the measured holding torque. Commands that leave out
+   gravity therefore never reach the robot.
+5. Switch to mode 9 and wait for confirmation. **Do not touch the arms while entering.**
+6. 1 kHz loop. Abort (final frame, then step 7) on any of these:
+   - a joint faster than `velocity_limit` (2 rad/s);
+   - a non-finite state or torque;
+   - a GDK read timeout or error;
+   - with `compensate_gravity` off, an arm without a command for `command_timeout`.
+7. **Restore the previous control mode** (the robot then holds the arms) and exit. Ctrl+C, SIGTERM,
    `docker stop`, aborts and errors all take this path. GDK never leaves mode 9 by itself.
 
 Robot-side limits that still apply (from the GDK docs):
@@ -157,14 +195,17 @@ rest.
 ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true urdf_path:=/models/<g2>.urdf
 ```
 
-Then run for real (C++, recommended for 1 kHz), or the Python version:
+Then run for real (C++, recommended for 1 kHz), or the Python version. With no `compensate_*`
+flags the node adds nothing and waits for full-torque commands on both arms. See Quick start for
+enabling the terms one at a time.
 
 ```bash
 ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=/models/<g2>.urdf
 ros2 launch g2_torque_subscriber torque_subscriber.launch.py impl:=py urdf_path:=/models/<g2>.urdf
 ```
 
-Send a command (Nm on top of gravity compensation; stop publishing and the arm floats after 100 ms):
+Send a command. With `compensate_gravity:=true` it is Nm on top of the model terms, and if you stop
+publishing the arm floats after 100 ms. With gravity off it must be the full torque.
 
 ```bash
 ros2 topic pub -r 500 --qos-reliability best_effort /g2_torque_subscriber/left/external_torques \
@@ -183,19 +224,24 @@ rules: no gravity compensation, the 50 Nm step e-stop, rejected frames, and join
 ```bash
 export G2_FAKE_URDF=/models/<g2>.urdf
 # C++
-ros2 launch g2_torque_subscriber torque_subscriber.launch.py backend:=fake urdf_path:=$G2_FAKE_URDF
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py backend:=fake urdf_path:=$G2_FAKE_URDF \
+  compensate_gravity:=true
 # Python: put the fake agibot_gdk first on PYTHONPATH
 PYTHONPATH=$(ros2 pkg prefix g2_torque_subscriber)/share/g2_torque_subscriber/fake_gdk:$PYTHONPATH \
-  ros2 launch g2_torque_subscriber torque_subscriber.launch.py impl:=py urdf_path:=$G2_FAKE_URDF
+  ros2 launch g2_torque_subscriber torque_subscriber.launch.py impl:=py urdf_path:=$G2_FAKE_URDF \
+  compensate_gravity:=true
 ```
 
 ## Tests (no robot needed, run inside the container)
 
 ```bash
-# End-to-end against the simulated arms. Checks float under gravity comp, command added on top
-# of g(q), timeout, rejected messages, velocity abort and SIGINT, each with mode restore. The fake
-# plant uses the same URDF as the node, so this tests the plumbing, not whether the URDF matches
-# the robot. That is what the on-robot dry-run table is for.
+# End-to-end against the simulated arms, 21 checks:
+#  - all three terms on: each term against an independent Pinocchio model, timeout, rejected
+#    messages, velocity abort and SIGINT, each with mode restore;
+#  - all off: no mode 9 without commands or with commands that leave out gravity; mode 9 with
+#    full-torque commands; abort and mode restore when they stop.
+# The fake plant uses the same URDF as the node, so this tests the plumbing, not whether the URDF
+# matches the robot. That is what the on-robot dry-run table is for.
 python3 src/g2_torque_subscriber/test/smoke_test_fake.py --impl cpp --urdf /models/<g2>.urdf
 python3 src/g2_torque_subscriber/test/smoke_test_fake.py --impl py  --urdf /models/<g2>.urdf
 # Real GDK next to ROS 2 (rmw_fastrtps and rmw_cyclonedds, C++ and Python): no crash, ROS
@@ -208,13 +254,13 @@ bash src/g2_torque_subscriber/test/coload_check.sh /models/<g2>.urdf
 ```
 g2_torque_subscriber/
   src/torque_subscriber_node.cpp       C++ node (ROS interface, torque law, lifecycle)
-  src/gravity_model.cpp                Pinocchio gravity of the 14 arm joints
+  src/dynamics_model.cpp               Pinocchio g(q), C(q,dq)dq, M(q)ddq of the 14 arm joints
   src/gdk_backend.cpp                  RobotBackend on the real GDK (dlopen'ed module)
   src/fake_backend.cpp                 RobotBackend with simulated arms (dlopen'ed module)
   g2_torque_subscriber/torque_subscriber_node.py   Python node (same interface)
   test/fake_gdk/agibot_gdk/            fake GDK Python module
   config/torque_subscriber.yaml        parameters (shared by both nodes)
-  launch/torque_subscriber.launch.py   impl:=cpp|py, dry_run, backend, urdf_path
+  launch/torque_subscriber.launch.py   impl:=cpp|py, dry_run, backend, urdf_path, compensate_*
 docker/                                Humble image, entrypoint, run.sh
 joint_torque_demo.py                   vendor example the torque handling follows
 ```

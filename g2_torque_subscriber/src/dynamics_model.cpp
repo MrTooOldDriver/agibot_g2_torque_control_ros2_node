@@ -1,7 +1,6 @@
-#include "g2_torque_subscriber/gravity_model.hpp"
+#include "g2_torque_subscriber/dynamics_model.hpp"
 
 #include <algorithm>
-#include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -18,7 +17,7 @@ bool IsArmJoint(const std::string& name) {
 }
 }  // namespace
 
-GravityModel::GravityModel(const std::string& urdf_path) : urdf_path_(urdf_path) {
+DynamicsModel::DynamicsModel(const std::string& urdf_path) {
   if (urdf_path.empty()) throw std::runtime_error("empty URDF path");
   try {
     pinocchio::urdf::buildModel(urdf_path, model_);  // fixed base
@@ -27,6 +26,10 @@ GravityModel::GravityModel(const std::string& urdf_path) : urdf_path_(urdf_path)
   }
   data_ = pinocchio::Data(model_);
   q_ = pinocchio::neutral(model_);
+  v_ = Eigen::VectorXd::Zero(model_.nv);
+  zero_v_ = Eigen::VectorXd::Zero(model_.nv);
+  a_ = Eigen::VectorXd::Zero(model_.nv);
+  g_full_ = Eigen::VectorXd::Zero(model_.nv);
 
   for (std::size_t i = 0; i < kArmDof; ++i) {
     const std::string name = kArmJointNames[i];
@@ -42,12 +45,12 @@ GravityModel::GravityModel(const std::string& urdf_path) : urdf_path_(urdf_path)
   for (std::size_t j = 1; j < static_cast<std::size_t>(model_.njoints); ++j) {
     const auto& joint = model_.joints[j];
     if (joint.nq() == 1 && joint.nv() == 1 && !IsArmJoint(model_.names[j])) {
-      others_.push_back({model_.names[j], joint.idx_q()});
+      others_.push_back({model_.names[j], joint.idx_q(), joint.idx_v()});
     }
   }
 }
 
-bool GravityModel::Bind(const JointFrame& frame) {
+bool DynamicsModel::Bind(const JointFrame& frame) {
   const std::size_t n = frame.names.size();
   if (bound_size_ == n && n > 0) {
     bool same = true;
@@ -70,14 +73,14 @@ bool GravityModel::Bind(const JointFrame& frame) {
   bound_others_.clear();
   for (const auto& o : others_) {
     const auto it = index.find(o.name);
-    if (it != index.end()) bound_others_.push_back({it->second, o.idx_q});
+    if (it != index.end()) bound_others_.push_back({it->second, o.idx_q, o.idx_v});
   }
   bound_size_ = n;
   return true;
 }
 
-void GravityModel::Extract(const JointFrame& frame, ArmVector& q, ArmVector& dq,
-                           ArmVector& effort) const {
+void DynamicsModel::Extract(const JointFrame& frame, ArmVector& q, ArmVector& dq,
+                            ArmVector& effort) const {
   for (std::size_t i = 0; i < kArmDof; ++i) {
     const std::size_t k = arm_frame_idx_[i];
     q[i] = frame.position[k];
@@ -86,12 +89,46 @@ void GravityModel::Extract(const JointFrame& frame, ArmVector& q, ArmVector& dq,
   }
 }
 
-const ArmVector& GravityModel::Gravity(const JointFrame& frame) {
-  for (const auto& b : bound_others_) q_[b.idx_q] = frame.position[b.frame_idx];
-  for (std::size_t i = 0; i < kArmDof; ++i) q_[arm_q_[i]] = frame.position[arm_frame_idx_[i]];
-  const Eigen::VectorXd& g = pinocchio::computeGeneralizedGravity(model_, data_, q_);
-  for (std::size_t i = 0; i < kArmDof; ++i) gravity_[i] = g[arm_v_[i]];
+void DynamicsModel::SetState(const JointFrame& frame) {
+  for (const auto& b : bound_others_) {
+    q_[b.idx_q] = frame.position[b.frame_idx];
+    v_[b.idx_v] = frame.velocity[b.frame_idx];
+  }
+  for (std::size_t i = 0; i < kArmDof; ++i) {
+    q_[arm_q_[i]] = frame.position[arm_frame_idx_[i]];
+    v_[arm_v_[i]] = frame.velocity[arm_frame_idx_[i]];
+  }
+  gravity_valid_ = false;
+}
+
+void DynamicsModel::EnsureGravity() {
+  if (gravity_valid_) return;
+  g_full_ = pinocchio::computeGeneralizedGravity(model_, data_, q_);
+  for (std::size_t i = 0; i < kArmDof; ++i) gravity_[i] = g_full_[arm_v_[i]];
+  gravity_valid_ = true;
+}
+
+const ArmVector& DynamicsModel::Gravity() {
+  EnsureGravity();
   return gravity_;
+}
+
+const ArmVector& DynamicsModel::Coriolis() {
+  EnsureGravity();
+  // nonLinearEffects = C(q, v) v + g(q)
+  const Eigen::VectorXd& nle = pinocchio::nonLinearEffects(model_, data_, q_, v_);
+  for (std::size_t i = 0; i < kArmDof; ++i) coriolis_[i] = nle[arm_v_[i]] - gravity_[i];
+  return coriolis_;
+}
+
+const ArmVector& DynamicsModel::Inertia(const ArmVector& ddq) {
+  EnsureGravity();
+  // rnea(q, 0, a) = M(q) a + g(q), a = ddq on the arm joints, 0 elsewhere
+  a_.setZero();
+  for (std::size_t i = 0; i < kArmDof; ++i) a_[arm_v_[i]] = ddq[i];
+  const Eigen::VectorXd& tau = pinocchio::rnea(model_, data_, q_, zero_v_, a_);
+  for (std::size_t i = 0; i < kArmDof; ++i) inertia_[i] = tau[arm_v_[i]] - gravity_[i];
+  return inertia_;
 }
 
 }  // namespace g2_torque_subscriber

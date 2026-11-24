@@ -2,15 +2,20 @@
 
 Same ROS interface, parameters and torque law as the C++ node; see the header of
 src/torque_subscriber_node.cpp. Each arm listens on its own topic (std_msgs/Float64MultiArray,
-7 values, joint1..joint7). A command is the torque added ON TOP OF GRAVITY COMPENSATION (the meaning
-it has on a Franka):
+7 values, joint1..joint7). The node can add the terms of the vendor demo joint_torque_demo.py
+(tau = rnea(q, dq, ddq_d) + ...), each behind a flag, all OFF by default:
 
-    tau = g(q) + tau_ext - joint_damping * dq
+    tau = [compensate_gravity]  g(q)
+        + [compensate_coriolis] C(q, dq) dq          (measured velocities, waist/head included)
+        + [compensate_inertia]  M(q) ddq_d           (ddq_d from ~/<arm>/desired_accelerations)
+        + tau_ext - joint_damping * dq
     tau = clamp(tau, +-effort_limit_scale * URDF effort limit)
     tau = tau_prev + clamp(tau - tau_prev, +-max_torque_step)     (tau_prev of frame 0 = measured effort)
 
-A timed-out arm keeps gravity compensation (tau_ext = 0), it does NOT get zero torque: in G2 mode 9
-zero total torque drops the arm.
+Gravity compensation on: a timed-out arm keeps the compensation terms (tau_ext = 0, it floats).
+Gravity compensation off: the commands carry the full torque; mode 9 is entered only once both
+arms are commanded close to the holding torque, and a timed-out arm ends the stream (zero torque
+would drop a G2 arm).
 
 Threads: the GDK torque loop (agibot_gdk Robot.joint_torque_control: read -> callback -> write,
 1 kHz best effort in Python) runs on the main thread; the rclpy executor spins on a background
@@ -45,6 +50,10 @@ ARM_LABELS = ("left", "right")
 MODE_JOINT_TORQUE = 9
 
 
+def arm_slice(arm):
+    return slice(arm * JOINTS_PER_ARM, (arm + 1) * JOINTS_PER_ARM)
+
+
 def import_gdk():
     """Import agibot_gdk with RTLD_LOCAL | RTLD_DEEPBIND.
 
@@ -60,39 +69,43 @@ def import_gdk():
     return agibot_gdk
 
 
-class GravityModel:
-    """Gravity torques of the 14 arm joints from a URDF (Pinocchio).
+class DynamicsModel:
+    """Rigid-body terms of the 14 arm joints from a URDF (Pinocchio), as in joint_torque_demo.py.
 
-    Non-arm joints (waist, head) take their measured position from the frame.
+    rnea(q, dq, ddq) = M(q) ddq + C(q, dq) dq + g(q). Non-arm joints (waist, head) take their
+    measured position and velocity from the frame; their acceleration is 0.
     """
 
     def __init__(self, urdf_path):
         import pinocchio as pin  # noqa: PLC0415
 
         self._pin = pin
-        self.urdf_path = urdf_path
         self.model = pin.buildModelFromUrdf(urdf_path)  # fixed base
         self.data = self.model.createData()
+        nv = self.model.nv
         self._q = pin.neutral(self.model)
-        self._arm_q, self._arm_v, limits = [], [], []
+        self._v, self._zero_v, self._a = np.zeros(nv), np.zeros(nv), np.zeros(nv)
+        arm_q, arm_v, limits = [], [], []
         for name in ARM_JOINT_NAMES:
             if not self.model.existJointName(name):
                 raise RuntimeError(f"URDF has no joint {name}")
             joint = self.model.joints[self.model.getJointId(name)]
             if joint.nq != 1 or joint.nv != 1:
                 raise RuntimeError(f"URDF joint {name} is not 1-DoF")
-            self._arm_q.append(joint.idx_q)
-            self._arm_v.append(joint.idx_v)
+            arm_q.append(joint.idx_q)
+            arm_v.append(joint.idx_v)
             limits.append(max(1.0, float(self.model.effortLimit[joint.idx_v])))
+        self._arm_q, self._arm_v = np.array(arm_q), np.array(arm_v)
         self.effort_limits = np.array(limits)
-        self._others = []  # (name, idx_q) of the non-arm 1-DoF joints
+        self._others = []  # (name, idx_q, idx_v) of the non-arm 1-DoF joints
         for jid in range(1, self.model.njoints):
             joint, name = self.model.joints[jid], self.model.names[jid]
             if joint.nq == 1 and joint.nv == 1 and name not in ARM_JOINT_NAMES:
-                self._others.append((name, joint.idx_q))
+                self._others.append((name, joint.idx_q, joint.idx_v))
         self._layout = None
         self._arm_idx = None
-        self._other_idx = None  # (frame index array, idx_q array)
+        self._other_idx = None  # (frame index, idx_q, idx_v) arrays
+        self._g = None
 
     def bind(self, names):
         """Locate the joints in a frame layout. False if an arm joint is missing."""
@@ -103,9 +116,8 @@ class GravityModel:
             self._layout = None
             return False
         self._arm_idx = np.array([index[n] for n in ARM_JOINT_NAMES])
-        pairs = [(index[n], iq) for n, iq in self._others if n in index]
-        self._other_idx = (np.array([p[0] for p in pairs], dtype=int),
-                           np.array([p[1] for p in pairs], dtype=int))
+        found = [(index[n], iq, iv) for n, iq, iv in self._others if n in index]
+        self._other_idx = tuple(np.array([f[k] for f in found], dtype=int) for k in range(3))
         self._layout = list(names)
         return True
 
@@ -113,13 +125,32 @@ class GravityModel:
         """The 14 arm entries of a whole-body array, ARM_JOINT_NAMES order."""
         return values[self._arm_idx]
 
-    def gravity(self, position):
-        """Gravity torques of the 14 arm joints at the whole-body position array of a frame."""
-        frame_idx, q_idx = self._other_idx
-        self._q[q_idx] = position[frame_idx]
+    def set_state(self, position, velocity):
+        """Load a frame's whole-body positions / velocities for the terms below."""
+        fi, oq, ov = self._other_idx
+        self._q[oq], self._v[ov] = position[fi], velocity[fi]
         self._q[self._arm_q] = position[self._arm_idx]
-        g = self._pin.computeGeneralizedGravity(self.model, self.data, self._q)
-        return np.asarray(g)[self._arm_v].copy()
+        self._v[self._arm_v] = velocity[self._arm_idx]
+        self._g = None
+
+    def gravity(self):
+        """g(q) of the arm joints."""
+        if self._g is None:
+            g = self._pin.computeGeneralizedGravity(self.model, self.data, self._q)
+            self._g = np.asarray(g)[self._arm_v].copy()
+        return self._g
+
+    def coriolis(self):
+        """C(q, v) v of the arm joints (v = measured velocities of all joints)."""
+        nle = self._pin.nonLinearEffects(self.model, self.data, self._q, self._v)
+        return np.asarray(nle)[self._arm_v] - self.gravity()
+
+    def inertia(self, ddq):
+        """M(q) ddq of the arm joints (ddq on the arm joints, 0 elsewhere)."""
+        self._a[:] = 0.0
+        self._a[self._arm_v] = ddq
+        tau = self._pin.rnea(self.model, self.data, self._q, self._zero_v, self._a)
+        return np.asarray(tau)[self._arm_v] - self.gravity()
 
 
 def frame_arrays(state):
@@ -144,19 +175,27 @@ class TorqueSubscriberNode(Node):
         self.phase = "idle"
         self._declare_parameters()
 
-        self._cmd_lock = threading.Lock()
-        self._cmd = np.zeros(ARM_DOF)
-        self._cmd_stamp = [None, None]  # time.monotonic() of the last valid command per arm
-        self._was_fresh = [False, False]
+        self._input_lock = threading.Lock()
+        self._torque_in = np.zeros(ARM_DOF)
+        self._accel_in = np.zeros(ARM_DOF)
+        self._torque_stamp = [None, None]  # time.monotonic() of the last valid input per arm
+        self._accel_stamp = [None, None]
+        self._was_cmd_fresh = [False, False]
+        self._was_acc_fresh = [False, False]
 
         cmd_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
                              reliability=ReliabilityPolicy.BEST_EFFORT,
                              durability=DurabilityPolicy.VOLATILE)
-        self._subs = [
-            self.create_subscription(Float64MultiArray, self.p["torque_topics"][arm],
-                                     lambda msg, arm=arm: self._on_arm_command(arm, msg), cmd_qos)
-            for arm in range(2)
-        ]
+        self._torque_subs = [
+            self.create_subscription(
+                Float64MultiArray, self.p["torque_topics"][arm],
+                lambda msg, arm=arm: self._on_arm_input(arm, msg, "torque command"), cmd_qos)
+            for arm in range(2)]
+        self._accel_subs = [
+            self.create_subscription(
+                Float64MultiArray, self.p["acceleration_topics"][arm],
+                lambda msg, arm=arm: self._on_arm_input(arm, msg, "desired acceleration"), cmd_qos)
+            for arm in range(2)]
         state_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
                                reliability=ReliabilityPolicy.RELIABLE,
                                durability=DurabilityPolicy.VOLATILE)
@@ -167,14 +206,17 @@ class TorqueSubscriberNode(Node):
         self._joint_states_pub = pub(self.p["joint_states_topic"])
         self._arm_state_pubs = [pub(t) for t in self.p["arm_state_topics"]]
         self._commanded_pub = pub(self.p["commanded_torques_topic"])
+        self._compensation_pub = pub(self.p["compensation_torques_topic"])
         self._arm_msgs = []
         for arm in range(2):
             m = JointState()
-            m.name = ARM_JOINT_NAMES[arm * JOINTS_PER_ARM:(arm + 1) * JOINTS_PER_ARM]
+            m.name = ARM_JOINT_NAMES[arm_slice(arm)]
             self._arm_msgs.append(m)
         self._full_msg = JointState()
         self._cmd_msg = JointState()
         self._cmd_msg.name = list(ARM_JOINT_NAMES)
+        self._comp_msg = JointState()
+        self._comp_msg.name = list(ARM_JOINT_NAMES)
         self.create_timer(0.1, self._status_tick)
 
         self.model = None
@@ -182,11 +224,21 @@ class TorqueSubscriberNode(Node):
         self._prev_tau = None
         self._first_frame = True
         self.abort_reason = None
-        self.get_logger().info(
-            f"G2 torque subscriber (Python): left '{self._subs[0].topic_name}', right "
-            f"'{self._subs[1].topic_name}' (7 values each, Nm on top of gravity compensation; "
-            f"QoS KeepLast(1)/BestEffort/Volatile), timeout {self.p['command_timeout']:.3f} s"
+        log = self.get_logger()
+        log.info(
+            f"G2 torque subscriber (Python): left '{self._torque_subs[0].topic_name}', right "
+            f"'{self._torque_subs[1].topic_name}' (7 values each, Nm; QoS KeepLast(1)/BestEffort/"
+            f"Volatile), timeout {self.p['command_timeout']:.3f} s"
             + (", DRY RUN (nothing is sent to the robot)" if self.p["dry_run"] else ""))
+        on = {True: "on", False: "off"}
+        log.info(f"compensation: gravity {on[self.p['compensate_gravity']]}, coriolis "
+                 f"{on[self.p['compensate_coriolis']]}, inertia {on[self.p['compensate_inertia']]}"
+                 + (" (desired accelerations on ~/<arm>/desired_accelerations)"
+                    if self.p["compensate_inertia"] else ""))
+        if not self.p["compensate_gravity"]:
+            log.warn("gravity compensation is OFF: torque commands must contain the FULL torque, "
+                     "gravity included. Mode 9 is entered only once both arms are commanded close "
+                     "to the holding torque; a missing command ends the torque loop.")
 
     # ------------------------------------------------------------------------------------------
     def _declare_parameters(self):
@@ -194,12 +246,20 @@ class TorqueSubscriberNode(Node):
         p = {
             "urdf_path": d("urdf_path", "").value,
             "urdf_dir": d("urdf_dir", "/home/agi/app/share/genie_robot_description/urdf").value,
+            "compensate_gravity": bool(d("compensate_gravity", False).value),
+            "compensate_coriolis": bool(d("compensate_coriolis", False).value),
+            "compensate_inertia": bool(d("compensate_inertia", False).value),
             "torque_topics": [d("left_torque_topic", "~/left/external_torques").value,
                               d("right_torque_topic", "~/right/external_torques").value],
+            "acceleration_topics": [
+                d("left_acceleration_topic", "~/left/desired_accelerations").value,
+                d("right_acceleration_topic", "~/right/desired_accelerations").value],
             "arm_state_topics": [d("left_joint_states_topic", "~/left/joint_states").value,
                                  d("right_joint_states_topic", "~/right/joint_states").value],
             "joint_states_topic": d("joint_states_topic", "joint_states").value,
             "commanded_torques_topic": d("commanded_torques_topic", "~/commanded_torques").value,
+            "compensation_torques_topic": d("compensation_torques_topic",
+                                            "~/compensation_torques").value,
             "publish_decimation": max(1, int(d("publish_decimation", 1).value)),
             "command_timeout": float(d("command_timeout", 0.1).value),
             "max_torque_step": float(d("max_torque_step", 15.0).value),
@@ -224,49 +284,67 @@ class TorqueSubscriberNode(Node):
         self.p = p
 
     # ------------------------------------------------------------------------------------------
-    # Command subscription (executor thread)
+    # Inputs (executor thread)
     # ------------------------------------------------------------------------------------------
-    def _on_arm_command(self, arm, msg):
+    def _on_arm_input(self, arm, msg, what):
         data = msg.data
         if len(data) != JOINTS_PER_ARM:
             self.get_logger().error(
-                f"{ARM_LABELS[arm]} arm: torque command with {len(data)} elements, expected "
+                f"{ARM_LABELS[arm]} arm: {what} with {len(data)} elements, expected "
                 f"{JOINTS_PER_ARM}; ignored", throttle_duration_sec=1.0)
             return
         values = np.asarray(data, dtype=float)
         if not np.all(np.isfinite(values)):
-            self.get_logger().error(f"{ARM_LABELS[arm]} arm: torque command contains NaN/Inf; "
-                                    "ignored", throttle_duration_sec=1.0)
+            self.get_logger().error(f"{ARM_LABELS[arm]} arm: {what} contains NaN/Inf; ignored",
+                                    throttle_duration_sec=1.0)
             return
-        with self._cmd_lock:
-            self._cmd[arm * JOINTS_PER_ARM:(arm + 1) * JOINTS_PER_ARM] = values
-            self._cmd_stamp[arm] = time.monotonic()
+        torque = what == "torque command"
+        with self._input_lock:
+            (self._torque_in if torque else self._accel_in)[arm_slice(arm)] = values
+            (self._torque_stamp if torque else self._accel_stamp)[arm] = time.monotonic()
 
-    def _external_torque(self):
-        ext = np.zeros(ARM_DOF)
-        now = time.monotonic()
-        with self._cmd_lock:
+    def _latest_inputs(self):
+        """(tau_ext, ddq_d, fresh): stale inputs are 0; fresh[arm] = that arm's command is fresh."""
+        ext, ddq = np.zeros(ARM_DOF), np.zeros(ARM_DOF)
+        now, timeout = time.monotonic(), self.p["command_timeout"]
+        fresh = [False, False]
+        with self._input_lock:
             for arm in range(2):
-                stamp = self._cmd_stamp[arm]
-                if stamp is not None and now - stamp < self.p["command_timeout"]:
-                    sl = slice(arm * JOINTS_PER_ARM, (arm + 1) * JOINTS_PER_ARM)
-                    ext[sl] = self._cmd[sl]
-        return ext
+                sl = arm_slice(arm)
+                stamp = self._torque_stamp[arm]
+                if stamp is not None and now - stamp < timeout:
+                    fresh[arm] = True
+                    ext[sl] = self._torque_in[sl]
+                stamp = self._accel_stamp[arm]
+                if stamp is not None and now - stamp < timeout:
+                    ddq[sl] = self._accel_in[sl]
+        return ext, ddq, fresh
 
     def _status_tick(self):
-        now = time.monotonic()
-        with self._cmd_lock:
-            fresh = [s is not None and now - s < self.p["command_timeout"] for s in self._cmd_stamp]
+        now, timeout = time.monotonic(), self.p["command_timeout"]
+        with self._input_lock:
+            cmd = [s is not None and now - s < timeout for s in self._torque_stamp]
+            acc = [s is not None and now - s < timeout for s in self._accel_stamp]
+        log = self.get_logger()
         for arm in range(2):
-            if fresh[arm] != self._was_fresh[arm]:
-                if fresh[arm]:
-                    self.get_logger().info(f"{ARM_LABELS[arm]} arm: receiving torque commands")
+            label = ARM_LABELS[arm]
+            if cmd[arm] != self._was_cmd_fresh[arm]:
+                if cmd[arm]:
+                    log.info(f"{label} arm: receiving torque commands")
+                elif self.p["compensate_gravity"]:
+                    log.warn(f"{label} arm: no torque command for {timeout:.3f} s -> external "
+                             "torque 0 (compensation terms continue)")
                 else:
-                    self.get_logger().warn(
-                        f"{ARM_LABELS[arm]} arm: no torque command for "
-                        f"{self.p['command_timeout']:.3f} s -> external torque 0 (gravity "
-                        "compensation only)")
-                self._was_fresh[arm] = fresh[arm]
+                    log.warn(f"{label} arm: no torque command for {timeout:.3f} s (gravity "
+                             "compensation is off: the torque loop does not run without commands)")
+                self._was_cmd_fresh[arm] = cmd[arm]
+            if self.p["compensate_inertia"] and acc[arm] != self._was_acc_fresh[arm]:
+                if acc[arm]:
+                    log.info(f"{label} arm: receiving desired accelerations")
+                else:
+                    log.warn(f"{label} arm: no desired acceleration for {timeout:.3f} s -> "
+                             "inertia term 0")
+                self._was_acc_fresh[arm] = acc[arm]
 
     # ------------------------------------------------------------------------------------------
     # Control (main thread)
@@ -279,7 +357,7 @@ class TorqueSubscriberNode(Node):
             return 1
         try:
             self.phase = "preparing"
-            return self._prepare_and_run(gdk, robot)
+            return self._prepare_and_run(robot)
         finally:
             del robot
             try:
@@ -313,7 +391,7 @@ class TorqueSubscriberNode(Node):
             return None
         return result["robot"]
 
-    def _prepare_and_run(self, gdk, robot):
+    def _prepare_and_run(self, robot):
         log = self.get_logger()
         # ---- Dynamics model ----
         urdf = self.p["urdf_path"]
@@ -324,28 +402,31 @@ class TorqueSubscriberNode(Node):
                 return 1
             urdf = f"{self.p['urdf_dir']}/{urdf_type}/{urdf_type}.urdf"
         try:
-            self.model = GravityModel(urdf)
+            self.model = DynamicsModel(urdf)
         except Exception as e:  # noqa: BLE001
             log.fatal(f"cannot load URDF '{urdf}': {e}")
             return 1
-        log.info(f"gravity model: {urdf}")
+        log.info(f"dynamics model: {urdf}")
 
         # ---- Pre-flight ----
         names, pos, vel, eff = frame_arrays(robot.get_joint_states())
         if not self.model.bind(names):
             log.fatal("the robot state misses one of the 14 arm joints")
             return 1
-        if not self._gravity_check(pos, vel, eff):
+        if not self._preflight_check(pos, vel, eff):
             return 1
         if self.p["dry_run"]:
             return self._run_dry(robot)
 
-        # ---- Remember the control mode, then enter mode 9 ----
+        # ---- Remember the control mode ----
         old_mode = int(robot.get_motion_control_status().control_mode)
         if old_mode == MODE_JOINT_TORQUE:
             log.fatal("robot is already in mode 9 (a previous run did not exit cleanly?); cannot "
                       "tell which mode to restore. Switch it to mode 3 first.")
             return 1
+        # ---- Gravity compensation off: the commands must hold the arms before mode 9 ----
+        if not self.p["compensate_gravity"] and not self._wait_for_commands(robot):
+            return 0 if self.stop.is_set() else 1
         if self.stop.is_set():
             return 0
         self._set_realtime()
@@ -397,9 +478,11 @@ class TorqueSubscriberNode(Node):
                 raise RuntimeError(msg) from e
             self.get_logger().warn(msg + "; continuing without real-time priority")
 
-    def _gravity_check(self, pos, vel, eff):
+    def _preflight_check(self, pos, vel, eff):
+        """Model gravity vs measured effort. Refuses the start only with gravity compensation on."""
         log = self.get_logger()
-        g = self.model.gravity(pos)
+        self.model.set_state(pos, vel)
+        g = self.model.gravity()
         effort = self.model.arm(eff)
         diff = g - effort
         lines = ["pre-flight: model gravity vs measured effort (Nm)"]
@@ -411,10 +494,10 @@ class TorqueSubscriberNode(Node):
         if speed > 0.05:
             log.warn(f"arms are moving ({speed:.3f} rad/s): the gravity check is unreliable")
         if not np.all(np.isfinite(g)):
-            log.fatal("gravity model returned NaN/Inf")
+            log.fatal("dynamics model returned NaN/Inf")
             return False
         tol = self.p["gravity_check_tolerance"]
-        if tol > 0.0 and worst > tol:
+        if self.p["compensate_gravity"] and tol > 0.0 and worst > tol:
             log.fatal(f"gravity model differs from the measured effort by {worst:.3f} Nm > "
                       f"gravity_check_tolerance {tol:.3f} Nm: wrong URDF / payload / waist "
                       "posture? Refusing to enter mode 9.")
@@ -422,6 +505,40 @@ class TorqueSubscriberNode(Node):
         # Fallback torque for an abort before the first loop frame (frame 0 re-seeds it).
         self._prev_tau = effort.copy() if np.all(np.isfinite(effort)) else g
         return True
+
+    def _wait_for_commands(self, robot):
+        """Gravity compensation off: wait until both arms are commanded and the first torque is
+        within gravity_check_tolerance of the holding torque (measured effort). False on stop."""
+        log = self.get_logger()
+        log.info("waiting for torque commands on both arms (full torque, gravity included) "
+                 "before entering mode 9")
+        tol = self.p["gravity_check_tolerance"]
+        t_next = time.monotonic()
+        while not self.stop.is_set():
+            names, pos, vel, eff = frame_arrays(robot.get_joint_states())
+            if not self.model.bind(names):
+                log.fatal("the robot state misses one of the 14 arm joints")
+                return False
+            self.model.set_state(pos, vel)
+            ext, ddq, fresh = self._latest_inputs()
+            if all(fresh):
+                first = (self._model_torque(ddq) + ext
+                         - self.p["joint_damping"] * self.model.arm(vel))
+                diff = np.abs(first - self.model.arm(eff))
+                i = int(np.argmax(diff))
+                if tol <= 0.0 or diff[i] <= tol:
+                    log.info(f"commands on both arms, within {diff[i]:.3f} Nm of the holding torque")
+                    return True
+                log.warn(f"first torque differs from the holding torque by {diff[i]:.3f} Nm on "
+                         f"{ARM_JOINT_NAMES[i]} (> gravity_check_tolerance {tol:.3f}): not "
+                         "entering mode 9. Do the commands include gravity?",
+                         throttle_duration_sec=2.0)
+            else:
+                log.info(f"waiting for torque commands: left {'ok' if fresh[0] else 'missing'}, "
+                         f"right {'ok' if fresh[1] else 'missing'}", throttle_duration_sec=2.0)
+            t_next += 0.01
+            time.sleep(max(0.0, t_next - time.monotonic()))
+        return False
 
     def _run_dry(self, robot):
         log = self.get_logger()
@@ -457,6 +574,17 @@ class TorqueSubscriberNode(Node):
         req.joint_efforts = tau.tolist()
         return req
 
+    def _model_torque(self, ddq):
+        """Sum of the enabled model terms at the model state (bind + set_state first)."""
+        comp = np.zeros(ARM_DOF)
+        if self.p["compensate_gravity"]:
+            comp += self.model.gravity()
+        if self.p["compensate_coriolis"]:
+            comp += self.model.coriolis()
+        if self.p["compensate_inertia"]:
+            comp += self.model.inertia(ddq)
+        return comp
+
     def _compute(self, state):
         """Torque law for one frame. Raises Abort on a safety violation."""
         self.frames += 1
@@ -464,14 +592,22 @@ class TorqueSubscriberNode(Node):
         if not self.model.bind(names):
             self._abort("robot state misses an arm joint")
         q, dq, effort = self.model.arm(pos), self.model.arm(vel), self.model.arm(eff)
-        g = self.model.gravity(pos)
-        ext = self._external_torque()
+        self.model.set_state(pos, vel)
+        ext, ddq, fresh = self._latest_inputs()
+        comp = self._model_torque(ddq)
+        if not self.p["compensate_gravity"] and not self.p["dry_run"]:
+            for arm in range(2):
+                if not fresh[arm]:
+                    self._abort(f"{ARM_LABELS[arm]} arm: no torque command for "
+                                f"{self.p['command_timeout']:.3f} s and gravity compensation is "
+                                "off (zero torque would drop the arm)")
         if self._first_frame:  # the robot compares frame 0 with its holding torque (~ effort)
-            self._prev_tau = effort.copy() if np.all(np.isfinite(effort)) else g.copy()
+            self._prev_tau = (effort.copy() if np.all(np.isfinite(effort))
+                              else self.model.gravity().copy())
             self._first_frame = False
         lim = self.p["effort_limit_scale"] * self.model.effort_limits
         step = self.p["max_torque_step"]
-        tau = np.clip(g + ext - self.p["joint_damping"] * dq, -lim, lim)
+        tau = np.clip(comp + ext - self.p["joint_damping"] * dq, -lim, lim)
         tau = self._prev_tau + np.clip(tau - self._prev_tau, -step, step)
 
         if not (np.all(np.isfinite(q)) and np.all(np.isfinite(dq))):
@@ -486,14 +622,14 @@ class TorqueSubscriberNode(Node):
                             f"{vlim:.3f} rad/s")
         self._prev_tau = tau
         if self.frames % self.p["publish_decimation"] == 0:
-            self._publish(names, pos, vel, eff, q, dq, effort, tau)
+            self._publish(names, pos, vel, eff, q, dq, effort, tau, comp)
         return tau
 
     def _abort(self, reason):
         self.abort_reason = reason
         raise Abort(reason)
 
-    def _publish(self, names, pos, vel, eff, q, dq, effort, tau):
+    def _publish(self, names, pos, vel, eff, q, dq, effort, tau, comp):
         try:
             stamp = self.get_clock().now().to_msg()
             if self._joint_states_pub:
@@ -504,17 +640,18 @@ class TorqueSubscriberNode(Node):
                 self._joint_states_pub.publish(m)
             for arm in range(2):
                 if self._arm_state_pubs[arm]:
-                    sl = slice(arm * JOINTS_PER_ARM, (arm + 1) * JOINTS_PER_ARM)
+                    sl = arm_slice(arm)
                     m = self._arm_msgs[arm]
                     m.header.stamp = stamp
                     m.position, m.velocity, m.effort = (
                         q[sl].tolist(), dq[sl].tolist(), effort[sl].tolist())
                     self._arm_state_pubs[arm].publish(m)
-            if self._commanded_pub:
-                m = self._cmd_msg
-                m.header.stamp = stamp
-                m.position, m.velocity, m.effort = q.tolist(), dq.tolist(), tau.tolist()
-                self._commanded_pub.publish(m)
+            for pub, m, values in ((self._commanded_pub, self._cmd_msg, tau),
+                                   (self._compensation_pub, self._comp_msg, comp)):
+                if pub:
+                    m.header.stamp = stamp
+                    m.position, m.velocity, m.effort = q.tolist(), dq.tolist(), values.tolist()
+                    pub.publish(m)
         except Exception as e:  # noqa: BLE001  (e.g. context shut down while publishing)
             if rclpy.ok():
                 self.get_logger().warn(f"publish failed: {e}", throttle_duration_sec=1.0)
@@ -571,4 +708,4 @@ def main(args=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv))
