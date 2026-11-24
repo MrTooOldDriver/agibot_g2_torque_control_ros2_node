@@ -1,5 +1,52 @@
 # agibot_g2_torque_control_ros2_node
 
+## Check the robot connection
+
+Run this before the first launch. Steps 1 and 2 are read-only: the robot never enters torque mode.
+
+```bash
+# 1. Network (on the host)
+ip -4 addr | grep 10.42.1.102                       # wired card must be exactly 10.42.1.102/24
+ping -c 5 10.42.1.101                               # robot answers
+sudo ping 10.42.1.101 -i 0.001 -c 10000 -s 1200     # 1 kHz link: 0% loss, round trip well under 1 ms
+nc -zv 10.42.1.101 2379                             # GDK discovery service on the robot
+sudo ufw status                                     # if active: sudo ufw allow 8852/udp
+
+# 2. GDK, read-only (inside docker/run.sh)
+echo $LOCATOR_IP $AORTA_DISCOVERY_URI               # expect: 10.42.1.102 http://10.42.1.101:2379
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true urdf_path:=/models/<g2>.urdf
+ros2 topic hz /g2_torque_subscriber/left/joint_states   # second shell: ~100 Hz
+
+# 3. Torque-mode stream, UDP 8852 (watch during the first real run)
+sudo tcpdump -ni <wired interface> udp port 8852 -c 20
+```
+
+- **The `echo` prints nothing:** the GDK's `env.sh` found no 10.42.1.x address, so the GDK
+  cannot find the robot.
+- **The dry run stops at "connecting to the robot":** the robot is not reachable through the GDK.
+- **The dry run prints the gravity table:** the connection works. With the arms at rest, a small
+  `diff` also shows the URDF matches the robot.
+- **The first real run logs `JointTorqueControl returned kTimeout`:** no state arrives on UDP 8852
+  (IP, firewall or link). The node restores the previous control mode and exits. Steps 1 and 2
+  cannot check this stream, because the robot only uses it in torque mode.
+
+## Quick start
+
+```bash
+cd agibot_g2_torque_control_ros2_node
+docker/run.sh colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+MODELS_DIR=~/agibot_g2_torque_control/models/urdf docker/run.sh
+
+# inside the container
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py dry_run:=true urdf_path:=/models/<g2>.urdf
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py urdf_path:=/models/<g2>.urdf
+ros2 launch g2_torque_subscriber torque_subscriber.launch.py impl:=py urdf_path:=/models/<g2>.urdf
+
+# from a second shell (docker/run.sh): send a command to the left arm
+ros2 topic pub -r 500 --qos-reliability best_effort /g2_torque_subscriber/left/external_torques \
+  std_msgs/msg/Float64MultiArray "{data: [0, 0, 0, 2.0, 0, 0, 0]}"
+```
+
 Direct joint torque control of the **AGIBOT G2** arms from ROS 2 topics: the G2 counterpart of the
 `TorqueSubscriberController` in the franka_ros2 fork (`~/franka_ros2`,
 `franka_example_controllers/src/torque_subscriber_controller.cpp`). There are two implementations
